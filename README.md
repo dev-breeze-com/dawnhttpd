@@ -33,11 +33,11 @@ BUGS
    Strange bug in the tuple_cmp function. Debug to see if it occurs 
    on your computer, where the const parameter o2 gets reset to NULL.
 
-   Bug reports, patches and suggestions are much appreciated.
+   Bug reports, patches and suggestions are much appreciated.  
    See the GitHub account https://www.github.com/dev-breeze-com/dawnhttpd
 
 AUTHORS
 
-   Pierre Innocent ( dev@breezeos.com )
+   Pierre Innocent ( dev@breezeos.com )  
    The Breeze::OS website: http://www.breezeos.com
 
