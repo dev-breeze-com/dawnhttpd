@@ -1,4 +1,5 @@
 README
+======
 
    1. Introduction
    2. Building
@@ -8,6 +9,7 @@ README
 
 
 INTRODUCTION
+============
 
    dawnhttpd (Dawn HTTP deamon), derived from darkhttpd, is a simple web
    server written in portable ANSI C. It supports static pages, and MIME
@@ -18,17 +20,23 @@ INTRODUCTION
 
 
 BUILDING
+========
 
    Install dawnhttpd by running the following commands, as root:
    make && make install
+   copy settings.ini to /etc/dawnhttpd/
 
 
 CONFIGURATION
+=============
 
-   No configuration, see README.cmd.txt for commands.
+   INI-style configuration was added, in the updated version.
+   See README.cmd.txt for commands.
+   Guestbook entry keys should be encased by '<%' and '%>'.
 
 
 BUGS
+====
 
    Strange bug in the tuple_cmp function. Debug to see if it occurs 
    on your computer, where the const parameter o2 gets reset to NULL.
@@ -36,7 +44,9 @@ BUGS
    Bug reports, patches and suggestions are much appreciated.  
    See the GitHub account https://www.github.com/dev-breeze-com/dawnhttpd
 
+
 AUTHORS
+=======
 
    Pierre Innocent ( dev@breezeos.com )  
    The Breeze::OS website: http://www.breezeos.com

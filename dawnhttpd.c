@@ -21,7 +21,7 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
-static const char pkgname[] = "dawnhttpd/1.0.0";
+static const char pkgname[] = "dawnhttpd/1.1.0";
 static const char copyright[] = "copyright (c) 2016 Tsert.Com";
 
 /* Possible build options: -DDEBUG -DNO_IPV6 */
@@ -228,8 +228,8 @@ struct dlent {
 };
 
 struct data_tuple {
-	const char* key;
-	const char* value;
+	char* key;
+	char* value;
 };
 
 struct connection {
@@ -291,9 +291,13 @@ static int redirects_total = 0;
 static struct data_tuple* passwords[MAX_USERS];
 static int passwords_total = 0;
 
-static char mimebuffer[1 << 15];
+static char *mimebuf = NULL;
 static struct data_tuple* mimetypes[MAX_MIMES];
 static int mimetypes_total = 0;
+
+static char *inibuf = NULL;
+static struct data_tuple* inivalues[MAX_TUPLES];
+static int inivalues_total = 0;
 
 static size_t longest_ext = 0;
 
@@ -310,21 +314,22 @@ static char* keep_alive_field = NULL;
 static time_t now;
 
 /* Defaults can be overridden on the command-line */
-static const char* bindaddr;
+static const char* bindaddr = NULL;
 static uint16_t bindport = 8080; /* or 80 if running as root */
 static int max_connections = -1; /* kern.ipc.somaxconn */
 
 static const char* index_name = "index.html";
-static const char* post_filename = NULL;
+static const char* postfile_name = NULL;
+static const char* mimefile_name = NULL;
 
-static char guestbook_template[1<<12];
+static char* guestbook_template = NULL;
 static FILE* guestbook_file = NULL;
 
 static int no_listing = 0;
 
 static int sockin = -1;             /* socket to accept connections from */
 #ifdef HAVE_INET6
-static int inet6 = 0;               /* whether the socket uses inet6 */
+static int use_inet6 = 0;           /* whether the socket uses inet6 */
 #endif
 
 static char* wwwroot = NULL;        /* a path name */
@@ -703,7 +708,7 @@ static int add_redirect(const char* const host, const char* const url)
 static const char* get_address_text(const void* addr)
 {
 #ifdef HAVE_INET6
-	if (inet6) {
+	if (use_inet6) {
 		static char text_addr[INET6_ADDRSTRLEN];
 		inet_ntop(AF_INET6, (const struct in6_addr*)addr, text_addr,
 		          INET6_ADDRSTRLEN);
@@ -729,11 +734,10 @@ static void init_sockin(void)
 	int sockopt;
 #ifdef HAVE_INET6
 
-	if (inet6) {
+	if (use_inet6) {
 		memset(&addrin6, 0, sizeof(addrin6));
 
-		if (inet_pton(AF_INET6, bindaddr ? bindaddr : "::",
-		              &addrin6.sin6_addr) == -1) {
+		if (inet_pton(AF_INET6, bindaddr ? bindaddr : "::", &addrin6.sin6_addr) == -1) {
 			errx(1, "malformed --addr argument");
 		}
 
@@ -757,8 +761,7 @@ static void init_sockin(void)
 	/* reuse address */
 	sockopt = 1;
 
-	if (setsockopt(sockin, SOL_SOCKET, SO_REUSEADDR,
-        &sockopt, sizeof(sockopt)) == -1)
+	if (setsockopt(sockin, SOL_SOCKET, SO_REUSEADDR, &sockopt, sizeof(sockopt)) == -1)
 	{ err(1, "setsockopt(SO_REUSEADDR)"); }
 
 #if 0
@@ -784,12 +787,11 @@ static void init_sockin(void)
 	/* bind socket */
 #ifdef HAVE_INET6
 
-	if (inet6) {
+	if (use_inet6) {
 		addrin6.sin6_family = AF_INET6;
 		addrin6.sin6_port = htons(bindport);
 
-		if (bind(sockin, (struct sockaddr*)&addrin6,
-            sizeof(struct sockaddr_in6)) == -1)
+		if (bind(sockin, (struct sockaddr*)&addrin6, sizeof(struct sockaddr_in6)) == -1)
 		{ err(1, "bind(port %u)", bindport); }
 
 		addrin_len = sizeof(addrin6);
@@ -1000,13 +1002,14 @@ static void accept_connection(void)
 #ifdef HAVE_INET6
 	struct sockaddr_in6 addrin6;
 #endif
+
 	socklen_t sin_size;
 	struct connection* conn;
 	/* allocate and initialise struct connection */
 	conn = new_connection();
-#ifdef HAVE_INET6
 
-	if (inet6) {
+#ifdef HAVE_INET6
+	if (use_inet6) {
 		sin_size = sizeof(addrin6);
 		memset(&addrin6, 0, sin_size);
 		conn->socket = accept(sockin, (struct sockaddr*)&addrin6, &sin_size);
@@ -1024,9 +1027,9 @@ static void accept_connection(void)
 
 	nonblock_socket(conn->socket);
 	conn->state = RECV_REQUEST;
-#ifdef HAVE_INET6
 
-	if (inet6) {
+#ifdef HAVE_INET6
+	if (use_inet6) {
 		conn->client = addrin6.sin6_addr;
 	}
 	else
@@ -1435,20 +1438,33 @@ static void tuple_sort(struct data_tuple* tuples[], int total)
 	qsort( tuples, total, sizeof(struct data_tuple*), tuple_sortcmp );
 }
 
+static int dir_exists(const char* path)
+{
+	struct stat strec;
+	if ((stat(path, &strec) == -1) && (errno == ENOENT))
+	    return 0;
+	return S_ISDIR( strec.st_mode ) ? 1 : 0;
+}
+
 static int file_exists(const char* path)
 {
-	struct stat filestat;
-	if ((stat(path, &filestat) == -1) && (errno == ENOENT))
+	struct stat strec;
+	if ((stat(path, &strec) == -1) && (errno == ENOENT))
 	    return 0;
-	return 1;
+	return S_ISREG( strec.st_mode ) ? 1 : 0;
 }
 
 static int file_size(const char* path)
 {
-	struct stat filestat;
-	if ((stat(path, &filestat) == -1) && (errno == ENOENT))
+	struct stat strec;
+
+	if ((stat(path, &strec) == -1) && (errno == ENOENT))
         return 0;
-	return filestat.st_size;
+
+	if (S_ISREG( strec.st_mode ))
+		return strec.st_size;
+
+	return 0;
 }
 
 /* Adds contents of default_extension_map[] to mime_map list.  The array must
@@ -1509,19 +1525,31 @@ static char *parse_field(const struct connection *conn, const char *field) {
     return split_string(conn->request, bound1, bound2);
 }
 
+static char* skipcr(char *sptr, char **bptr)
+{
+    for (; *sptr != '\r' && *sptr != '\n'; sptr++) ;
+    for (; *sptr == '\r' || *sptr == '\n'; sptr++) ;
+    (*bptr) = sptr;
+    sptr--;
+    return sptr;
+}
+
 static int parse_tuples(struct connection* conn, struct data_tuple* tuples[],
     char* buffer, char delim, const char* echrs, int maximum)
 {
 	int for_hdr = tuples == (conn ? conn->headers : 0);
 	int for_body = tuples == (conn ? conn->tuples : 0);
 	int for_http = for_hdr || for_body;
-    int begofline = !for_hdr;
 	char *sptr = buffer;
 	char *bptr = sptr;
+	char *inigrp = NULL;
+    int begofline = !for_hdr;
 	int total, i = 0;
     int seqlen = 0;
+    int slen = 0;
 
-    if (debug && for_hdr) { printf("Buffer: '%s'\n", buffer); }
+    if (debug && for_hdr)
+    { printf("Buffer: '%s'\n", buffer); }
 
 	for (; (*sptr); sptr++) {
 
@@ -1540,12 +1568,33 @@ static int parse_tuples(struct connection* conn, struct data_tuple* tuples[],
 
 			case '#':
                 if ( begofline ) {
+                    sptr = skipcr( sptr, &bptr );
+                    /*
                     for (; *sptr != '\r' && *sptr != '\n'; sptr++) ;
                     for (; *sptr == '\r' || *sptr == '\n'; sptr++) ;
                     bptr = sptr;
                     sptr--;
+                    */
                 }
 			break;
+			case '[':
+                if (debug)
+                { printf("begofline=%d\n",begofline); }
+
+                if ( begofline ) {
+				    bptr = ++sptr;
+                    for (; *sptr != ']'; sptr++) ;
+					*sptr = '\0';
+
+                    inigrp = bptr;
+                    sptr = skipcr( sptr, &bptr );
+                    begofline = 1;
+
+					if (debug)
+					{ printf("inigrp='%s'\n",inigrp); }
+                }
+
+            break;
 			case '\r':
 			case '\n':
 
@@ -1568,6 +1617,11 @@ static int parse_tuples(struct connection* conn, struct data_tuple* tuples[],
                 else
                     seqlen = 0;
 
+                /*
+                if (debug)
+                { printf("SEQLEN=%d\n",seqlen); }
+                */
+
                 if (for_hdr && seqlen > 0) {
                     conn->body = sptr + seqlen;
 					*sptr++ = '\0';
@@ -1589,6 +1643,13 @@ static int parse_tuples(struct connection* conn, struct data_tuple* tuples[],
                     sptr = bptr;
                     sptr--;
                 }
+
+                /*
+                if (debug)
+                { printf("VALUE='%s'\n", tuples[i-1]->value); }
+                if (debug)
+                { printf("KEY='%s'\n", bptr); }
+                */
 			break;
 			case '&':
 			case ';':
@@ -1600,6 +1661,10 @@ static int parse_tuples(struct connection* conn, struct data_tuple* tuples[],
                         tuples[i]->key = NULL;
                     }
 
+                    if (debug)
+                    { printf("VALUE[%d]=\"%s\"\n", i-1, tuples[i-1]->value); }
+                /*
+                */
                     bptr = ++sptr;
 				}
 			break;
@@ -1616,8 +1681,22 @@ static int parse_tuples(struct connection* conn, struct data_tuple* tuples[],
 
                     *sptr = '\0';
 
-                    tuples[i]->key = bptr;
+                    if ( inigrp ) {
+                        slen = strlen(bptr) + strlen(inigrp) + 2;
+                        tuples[i]->key = xmalloc( slen );
+                        strcpy( tuples[i]->key, (const char*) inigrp );
+                        strcat( tuples[i]->key, (const char*) "/" );
+                        strcat( tuples[i]->key, (const char*) bptr );
+                    } else {
+                        tuples[i]->key = bptr;
+                    }
+
                     tuples[i]->value = NULL;
+
+                    if (debug)
+                    { printf("KEY[%d]=\"%s\" 0x%x\n", i, tuples[i]->key, tuples[i]->key); }
+                /*
+                */
 
 				    if (delim == '=') {
                         bptr = sptr+1;
@@ -1633,10 +1712,21 @@ static int parse_tuples(struct connection* conn, struct data_tuple* tuples[],
 		}
 	}
 
+	if (debug) {
+        printf("LAST TUPLES[%d]=0x%x\n", i, tuples[i] );
+    }
+
     if ( tuples[i] ) {
 
 		if ( tuples[i]->key ) {
+
+			if (debug)
+				{ printf("LAST TUPLES[%d]='%s'\n", i, tuples[i]->key ); }
+
 			if (bptr && !tuples[i]->value) {
+				if (debug)
+					{ printf("LAST VALUE TUPLES[%d]='%s'\n", i, bptr); }
+
 				tuples[i++]->value = bptr;
 			}
 		}
@@ -1648,14 +1738,30 @@ static int parse_tuples(struct connection* conn, struct data_tuple* tuples[],
 	}
 
     tuple_sort( tuples, total=i );
+
+    /*
+	if (debug)
+        { printf("TUPLES 0x%x\n", tuples ); }
+
+	if (debug)
+        { printf("TOTAL %d\n", i ); }
+
+    for (i=0; i<total; i++) {
+        printf(
+            "TUPLE[%d][0x%x][%s]='%s'\n",
+            i, tuples[i], tuples[i]->key, tuples[i]->value 
+        );
+	}
+    */
+
     return total;
 }
 
-static int load_file(const char* filename, char* buffer, int maximum)
+static int load_file(const char* filename, char** buffer, int maximum)
 {
 	FILE* fp = fopen( filename, "rb" );
 	int sz = file_size( filename );
-	char *sptr = buffer;
+	char *sptr = (*buffer) = NULL;
 	size_t nread = 0;
 	int total = sz;
 	int i = 0;
@@ -1666,6 +1772,8 @@ static int load_file(const char* filename, char* buffer, int maximum)
 
     if (sz >= maximum)
         return 0;
+
+	sptr = (*buffer) = xmalloc( sz+3 );
 
 	while (!feof( fp )) {
 
@@ -1679,27 +1787,50 @@ static int load_file(const char* filename, char* buffer, int maximum)
             sz -= nread;
         }
     }
+
 	fclose(fp);
+
+	sptr = (*buffer);
+	sptr += total;
+    (*sptr) = '\0';
+
     return total;
 }
 
-static int parse_mimefile(const char* filename, struct data_tuple* tuples[],
-    char delim, const char* echrs, int maximum)
+/*
+ * Adds contents of specified file to mime_map list.
+ */
+static int parse_mimefile(const char* filename)
 {
-    int total = load_file( filename, mimebuffer, (1 << 15));
-    mimebuffer[ total ] = '\0';
-    return parse_tuples( 0L, tuples, mimebuffer, '=', "\r\n", maximum );
+    int total = load_file( filename, &mimebuf, (1 << 15) );
+    if (total > 0)
+        total = parse_tuples( 0L, mimetypes, mimebuf, '=', "\r\n", MAX_MIMES );
+    return (mimetypes_total = total);
+}
+
+static int parse_inifile(const char* filename)
+{
+    int total = load_file( filename, &inibuf, (1 << 12) );
+    if (total > 0)
+        total = parse_tuples( 0L, inivalues, inibuf, '=', "\r\n", MAX_TUPLES );
+    return (inivalues_total = total);
 }
 
 static char* tuple_search(struct data_tuple* tuples[], int total, const char* arg)
 {
-    struct data_tuple key={ arg, NULL };
+    struct data_tuple key={ (char*) arg, NULL };
     struct data_tuple** found = bsearch(
 		&key, tuples, total,
 		sizeof(struct data_tuple*),
 		tuple_cmp
 	);
 	return (char*) (found ? (*found)->value : NULL);
+}
+
+static char* inisearch(const char* key, const char* deflt)
+{
+	char *value = tuple_search( inivalues, inivalues_total, key );
+	return value ? value : (char*) deflt;
 }
 
 static char* htpasswd(const char* user, const char* password)
@@ -1716,15 +1847,6 @@ static char* pwdsearch(const char* arg)
 static char* hdrsearch(struct connection* conn, const char* arg)
 {
 	return tuple_search( conn->headers, conn->headers_total, arg );
-}
-
-/*
- * Adds contents of specified file to mime_map list.
- */
-static int parse_extension_map_file(const char* filename)
-{
-	int total = parse_mimefile( filename, mimetypes, '=', "\r\n", MAX_MIMES );
-    return (mimetypes_total = total);
 }
 
 static const char* url_content_type(const char* url)
@@ -2096,7 +2218,7 @@ static int fill_guestbook(struct connection* conn)
 {
     char *sptr = guestbook_template;
     char *bptr = sptr;
-    char *value = 0L;
+    char *value = NULL;
 
     while ((sptr = strstr( sptr, "<%" ))) {
 
@@ -2379,9 +2501,9 @@ static void process_post(struct connection* conn)
         if (conn->tuples_total > 0) {
 
             if (fill_guestbook( conn )) {
-                if ( post_filename ) {
+                if ( postfile_name ) {
                     free(conn->url);
-                    conn->url = xstrdup( post_filename );
+                    conn->url = xstrdup( postfile_name );
 
                 } else if (strcmp( conn->url, "/" )) {
                     char *sptr = conn->url + strlen(conn->url);
@@ -2455,7 +2577,7 @@ static void process_request(struct connection* conn)
 static void poll_recv_request(struct connection* conn)
 {
 	char buf[1 << 15];
-	char *sptr = 0L;
+	char *sptr = NULL;
 	ssize_t recvd;
 
 	assert(conn->state == RECV_REQUEST);
@@ -3016,47 +3138,80 @@ static void stop_running(int sig unused)
 
 static void parse_commandline(const int argc, char* argv[])
 {
-	int i;
-	size_t len;
-
-	if ((argc < 2) || (argc == 2 && strcmp(argv[1], "--help") == 0)) {
-		usage(argv[0]); /* no wwwroot given */
-		exit(EXIT_SUCCESS);
-	}
+	const char *host = NULL;
+	const char *url = NULL;
+	char *rootdir = NULL;
+	char *value = NULL;
+	int optidx = 1;
+	size_t len = 0;
+	int i = 0;
 
 	memset( redirects, 0, sizeof(redirects) );
 	memset( mimetypes, 0, sizeof(mimetypes) );
 	memset( passwords, 0, sizeof(passwords) );
 
-	if (getuid() == 0) { bindport = 80; }
+	if (!parse_inifile( "/etc/dawnhttpd/settings.ini" )) {
+		errx(1, "Invalid ini settings file" );
+	}
 
-	wwwroot = xstrdup(argv[1]);
+	if (argv[1] && dir_exists( argv[1])) {
+		optidx = 2;
+		wwwroot = xstrdup(argv[1]);
+	} else {
+		rootdir = inisearch( "General/wwwroot", "/var/www/htdocs" );
+		wwwroot = xstrdup(rootdir);
+	}
+
 	/* Strip ending slash. */
-	len = strlen(wwwroot);
+	if ((len = strlen(wwwroot)) > 0) {
+		if (wwwroot[len - 1] == '/') {
+			wwwroot[len - 1] = '\0';
+		}
+	}
 
-	if (len > 0)
-		if (wwwroot[len - 1] == '/')
-		{ wwwroot[len - 1] = '\0'; }
+	if (!wwwroot)
+		errx(1, "No www rootdir specified !" );
+
+	printf( "Using WWWROOT '%s'\n", wwwroot );
+
+	value = inisearch( "General/use-ipv4", "yes" );
+
+	if (!strcasecmp( value, "yes" )) {
+		use_inet6 = 0;
+		bindaddr = inisearch( "General/ipv4-addr", NULL );
+	} else {
+		bindaddr = inisearch( "General/ipv6-addr", NULL );
+		use_inet6 = 1;
+	}
+
+	value = inisearch( "General/max-conn", "-1" );
+	max_connections = (int)xstr_to_num( value );
+
+	value = inisearch( "General/port", getuid() ? "8080" : "80" );
+	bindport = (int)xstr_to_num( value );
+
+	if ((value = inisearch( "General/daemon", NULL )))
+		want_daemon = !strcasecmp( value, "yes" );
+
+	pidfile_name = inisearch( "General/pidfile", NULL );
+	mimefile_name = inisearch( "General/mimetypes", NULL );
 
 	/* walk through the remainder of the arguments (if any) */
-	for (i = 2; i < argc; i++) {
+	for (i = optidx; i < argc; i++) {
 
 		if (strcmp(argv[i], "--port") == 0) {
 			if (++i >= argc)
 			{ errx(1, "missing number after --port"); }
-
 			bindport = (uint16_t)xstr_to_num(argv[i]);
 		}
 		else if (strcmp(argv[i], "--addr") == 0) {
 			if (++i >= argc)
 			{ errx(1, "missing ip after --addr"); }
-
 			bindaddr = argv[i];
 		}
 		else if (strcmp(argv[i], "--maxconn") == 0) {
 			if (++i >= argc)
 			{ errx(1, "missing number after --maxconn"); }
-
 			max_connections = (int)xstr_to_num(argv[i]);
 		}
 		else if (strcmp(argv[i], "--stdout") == 0) {
@@ -3077,8 +3232,7 @@ static void parse_commandline(const int argc, char* argv[])
 		else if (strcmp(argv[i], "--post") == 0) {
 			if (++i >= argc)
 			{ errx(1, "missing filename after --post"); }
-
-	       post_filename = argv[i];
+	        postfile_name = argv[i];
 		}
 		else if (strcmp(argv[i], "--no-listing") == 0) {
 			no_listing = 1;
@@ -3086,13 +3240,11 @@ static void parse_commandline(const int argc, char* argv[])
 		else if (strcmp(argv[i], "--mimetypes") == 0) {
 			if (++i >= argc)
 			{ errx(1, "missing filename after --mimetypes"); }
-
-			parse_extension_map_file(argv[i]);
+	        mimefile_name = argv[i];
 		}
 		else if (strcmp(argv[i], "--default-mimetype") == 0) {
 			if (++i >= argc)
 			{ errx(1, "missing string after --default-mimetype"); }
-
 			default_mimetype = argv[i];
 		}
 		else if (strcmp(argv[i], "--uid") == 0) {
@@ -3133,7 +3285,6 @@ static void parse_commandline(const int argc, char* argv[])
 		else if (strcmp(argv[i], "--pidfile") == 0) {
 			if (++i >= argc)
 			{ errx(1, "missing filename after --pidfile"); }
-
 			pidfile_name = argv[i];
 		}
 		else if (strcmp(argv[i], "--no-keepalive") == 0) {
@@ -3161,12 +3312,10 @@ static void parse_commandline(const int argc, char* argv[])
                 errx(1, "failed to open guestbook file");
             }
 
-			if (!load_file( gbook_template, guestbook_template, (1 << 12))) {
+			if (!load_file( gbook_template, &guestbook_template, (1 << 12))) {
 				errx(1, "invalid guestbook template file --guestbook");
 			}
 		} else if (strcmp(argv[i], "--forward") == 0) {
-
-			const char* host, *url;
 
 			if (++i >= argc)
 			{ errx(1, "missing host after --forward"); }
@@ -3189,15 +3338,19 @@ static void parse_commandline(const int argc, char* argv[])
 		else if (strcmp(argv[i], "--no-server-id") == 0) {
 			want_server_id = 0;
 		}
-
 #ifdef HAVE_INET6
 		else if (strcmp(argv[i], "--ipv6") == 0) {
-			inet6 = 1;
+			use_inet6 = 1;
 		}
-
 #endif
 		else
 		{ errx(1, "unknown argument `%s'", argv[i]); }
+	}
+
+	if ( mimefile_name ) {
+		if (!parse_mimefile( mimefile_name )) {
+			errx(1, "Invalid mimetype file");
+		}
 	}
 }
 
@@ -3206,7 +3359,7 @@ int main(int argc, char** argv)
 {
 	printf("%s, %s.\n", pkgname, copyright);
 
-	parse_commandline(argc, argv);
+	parse_commandline( argc, argv );
 
 	if (logfile_name == NULL)
 	    logfile = stdout;
@@ -3214,7 +3367,7 @@ int main(int argc, char** argv)
 		logfile = fopen(logfile_name, "ab");
 		if (logfile == NULL) {
             errx(1, "failed to open log file (\"%s\")", logfile_name);
-        }
+		}
 	}
 
 	parse_default_extension_map();
