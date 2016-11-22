@@ -19,17 +19,20 @@
     </section>
 
     <section class="main-content">
-      <p>README</p>
+      <h1>
+<a id="readme" class="anchor" href="#readme" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>README</h1>
 
 <ol>
 <li>Introduction</li>
 <li>Building</li>
 <li>Configuraton</li>
 <li>Bugs</li>
+<li>Fun facts</li>
 <li>Authors</li>
 </ol>
 
-<p>INTRODUCTION</p>
+<h1>
+<a id="introduction" class="anchor" href="#introduction" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>INTRODUCTION</h1>
 
 <p>dawnhttpd (Dawn HTTP deamon), derived from darkhttpd, is a simple web
    server written in portable ANSI C. It supports static pages, and MIME
@@ -38,24 +41,46 @@
    guestbook. It can, easily, be used in conjunction with Lighttpd as proxy.
    It compiles and runs on 32 and 64 bits computers.</p>
 
-<p>BUILDING</p>
+<h1>
+<a id="building" class="anchor" href="#building" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>BUILDING</h1>
 
 <p>Install dawnhttpd by running the following commands, as root:
-   make &amp;&amp; make install</p>
+   make &amp;&amp; make install
+   copy settings.ini to /etc/dawnhttpd/</p>
 
-<p>CONFIGURATION</p>
+<h1>
+<a id="configuration" class="anchor" href="#configuration" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>CONFIGURATION</h1>
 
-<p>No configuration, see README.cmd.txt for commands.</p>
+<p>INI-style configuration was added, in the updated version.
+   See README.cmd.txt for commands.
+   Guestbook entry keys should be encased by '&lt;%' and '%&gt;'.</p>
 
-<p>BUGS</p>
+<h1>
+<a id="bugs" class="anchor" href="#bugs" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>BUGS</h1>
 
 <p>Strange bug in the tuple_cmp function. Debug to see if it occurs 
-   on your computer, where the const parameter o2 gets reset to NULL.</p>
-
-<p>Bug reports, patches and suggestions are much appreciated.<br>
+   on your computer, where the const parameter o2 gets reset to NULL.
+   Bug reports, patches and suggestions are much appreciated.<br>
    See the GitHub account <a href="https://www.github.com/dev-breeze-com/dawnhttpd">https://www.github.com/dev-breeze-com/dawnhttpd</a></p>
 
-<p>AUTHORS</p>
+<h1>
+<a id="fun-facts" class="anchor" href="#fun-facts" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Fun Facts</h1>
+
+<p>On an AMD Athlon64 X2 (Mem 1G) running Linux 3.10.104-amd64, we get<br>
+   weighttp -n 100000 -c 375 -k -H 'User-Agent: Weighttp' 127.0.0.1:8 0<br>
+   weighttp - a lightweight and simple webserver benchmarking tool<br>
+   starting benchmark...<br>
+   spawning thread #1: 375 concurrent requests, 100000 total requests<br>
+   progress: 10% done<br>
+   ...<br>
+   progress: 100% done<br>
+   finished in 10 sec, 919 millisec and 115 microsec, 9158 req/s, 79580 kbyte/s<br>
+   requests: 100000 total, 100000 started, 100000 done, 100000 succeeded, 0 failed, 0 errored<br>
+   status codes: 100000 2xx, 0 3xx, 0 4xx, 0 5xx<br>
+   traffic: 889800000 bytes total, 22000000 bytes http, 867800000 bytes data  </p>
+
+<h1>
+<a id="authors" class="anchor" href="#authors" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>AUTHORS</h1>
 
 <p>Pierre Innocent ( <a href="mailto:dev@breezeos.com">dev@breezeos.com</a> )<br>
    The Breeze::OS website: <a href="http://www.breezeos.com">http://www.breezeos.com</a></p>
