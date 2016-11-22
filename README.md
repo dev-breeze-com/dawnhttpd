@@ -48,18 +48,18 @@ BUGS
 Fun Facts
 ========= 
 
-   On an AMD Athlon64 X2 (Mem 1G) running Linux 3.10.104-amd64, we get 
-   weighttp -n 100000 -c 375 -k -H 'User-Agent: Weighttp' 127.0.0.1:80 
-   weighttp - a lightweight and simple webserver benchmarking tool 
-   starting benchmark... 
-   spawning thread #1: 375 concurrent requests, 100000 total requests 
-   progress: 10% done 
-   ... 
-   progress: 100% done 
-   finished in 10 sec, 919 millisec and 115 microsec, 9158 req/s, 79580 kbyte/s 
-   requests: 100000 total, 100000 started, 100000 done, 100000 succeeded, 0 failed, 0 errored 
-   status codes: 100000 2xx, 0 3xx, 0 4xx, 0 5xx 
-   traffic: 889800000 bytes total, 22000000 bytes http, 867800000 bytes data 
+   On an AMD Athlon64 X2 (Mem 1G) running Linux 3.10.104-amd64, we get  
+   weighttp -n 100000 -c 375 -k -H 'User-Agent: Weighttp' 127.0.0.1:8 0  
+   weighttp - a lightweight and simple webserver benchmarking tool  
+   starting benchmark...  
+   spawning thread #1: 375 concurrent requests, 100000 total requests  
+   progress: 10% done  
+   ...  
+   progress: 100% done  
+   finished in 10 sec, 919 millisec and 115 microsec, 9158 req/s, 79580 kbyte/s  
+   requests: 100000 total, 100000 started, 100000 done, 100000 succeeded, 0 failed, 0 errored  
+   status codes: 100000 2xx, 0 3xx, 0 4xx, 0 5xx  
+   traffic: 889800000 bytes total, 22000000 bytes http, 867800000 bytes data  
 
 
 AUTHORS
