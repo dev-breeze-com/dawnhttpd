@@ -21,7 +21,7 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
-static const char pkgname[] = "dawnhttpd/1.1.0";
+static const char pkgname[] = "dawnhttpd/1.2.0";
 static const char copyright[] = "copyright (c) 2016 Tsert.Com";
 
 /* Possible build options: -DDEBUG -DNO_IPV6 */
@@ -97,6 +97,7 @@ static const int debug = 1;
 #define MAX_HEADERS 20
 #define MAX_TUPLES  100
 #define MAX_MIMES   500
+#define MAX_BUCKETS 17
 
 #if defined(O_EXCL) && !defined(O_EXLOCK)
 # define O_EXLOCK O_EXCL
@@ -232,6 +233,14 @@ struct data_tuple {
 	char* value;
 };
 
+struct data_bucket {
+	char* key;
+	char* value;
+	off_t size;
+	time_t lastmod;
+	time_t lifespan; /* Time to keep ~ 1 hour */
+};
+
 struct connection {
 
 	LIST_ENTRY(connection) entries;
@@ -263,6 +272,9 @@ struct connection {
 	char* referer, *user_agent;
 	char* host, *auth, *cookies;
 
+	off_t payload_size;
+	time_t payload_lastmod;
+
 	off_t range_begin, range_end;
 	off_t range_begin_given, range_end_given;
 
@@ -276,13 +288,16 @@ struct connection {
 	struct data_tuple* tuples[MAX_TUPLES];
 	size_t tuples_total, body_length;
 
-	enum { REPLY_GENERATED=0, REPLY_FROMFILE } reply_type;
+	enum { REPLY_GENERATED=0, REPLY_CACHED, REPLY_FROMFILE } reply_type;
 	char* reply;
 	int reply_dont_free;
 	int reply_fd;
 	off_t reply_start, reply_length, reply_sent,
 	      total_sent; /* header + body = total, for logging */
 };
+
+static const char* locate_dbpath = NULL;
+static const char* locate_maxhits = NULL;
 
 static const char* redirect_all_url = NULL;
 static struct data_tuple* redirects[MAX_REDIRS];
@@ -298,6 +313,9 @@ static int mimetypes_total = 0;
 static char *inibuf = NULL;
 static struct data_tuple* inivalues[MAX_TUPLES];
 static int inivalues_total = 0;
+
+static struct data_bucket* buckets[MAX_BUCKETS];
+static int buckets_total = 0;
 
 static size_t longest_ext = 0;
 
@@ -327,24 +345,28 @@ static FILE* guestbook_file = NULL;
 
 static int no_listing = 0;
 
-static int sockin = -1;             /* socket to accept connections from */
+static int sockin = -1;   /* socket to accept connections from */
 #ifdef HAVE_INET6
-static int use_inet6 = 0;           /* whether the socket uses inet6 */
+static int use_inet6 = 0; /* whether the socket uses inet6 */
 #endif
 
-static char* wwwroot = NULL;        /* a path name */
+static char* wwwroot = NULL;      /* a path name */
 static char* server_hdr = NULL;
-static char* pidfile_name = NULL;   /* NULL = no pidfile */
+static char* pidfile_name = NULL; /* NULL = no pidfile */
 static char* logfile_name = "/var/log/dawnhttpd.log";
 static FILE* logfile = NULL;
 
 static int want_chroot = 0;
+static int want_cache = 0;
 static int want_daemon = 0;
 static int want_accf = 0;
 static int want_keepalive = 1;
 static int want_server_id = 1;
+static int wwwrootlen = 0;
 
-static uint64_t num_requests = 0, total_in = 0, total_out = 0;
+static uint64_t total_in = 0;
+static uint64_t total_out = 0;
+static uint64_t num_requests = 0;
 
 static volatile int running = 1; /* signal handler sets this to false */
 
@@ -1235,11 +1257,13 @@ static void strntoupper(char* str, const size_t length)
 static void poll_check_timeout(struct connection* conn)
 {
 	if (idletime > 0) { /* optimised away by compiler */
-		if (now - conn->last_active >= idletime) {
-			if (debug)
-				printf("poll_check_timeout(%d) caused closure\n",
-				       conn->socket);
-
+		if ((now - conn->last_active) >= idletime) {
+			if (debug) {
+				printf(
+					"poll_check_timeout(%d) caused closure\n",
+					conn->socket
+				);
+			}
 			conn->conn_close = 1;
 			conn->state = DONE;
 		}
@@ -1314,6 +1338,7 @@ static const char* generated_on(const char date[DATE_LEN])
 
 /* A default reply for any (erroneous) occasion. */
 static void default_reply(struct connection* conn, const int errcode, const char* errname, const char* format, ...) __printflike(4, 5);
+
 static void default_reply(struct connection* conn, const int errcode, const char* errname, const char* format, ...)
 {
 	char* reason, date[DATE_LEN];
@@ -1346,6 +1371,7 @@ static void default_reply(struct connection* conn, const int errcode, const char
         "\r\n",
         errcode, errname, date, server_hdr, keep_alive(conn),
         llu(conn->reply_length));
+
 	conn->reply_type = REPLY_GENERATED;
 	conn->http_code = errcode;
 }
@@ -1408,6 +1434,20 @@ static char* decode_url(struct connection* conn)
 	return conn->decoded_url;
 }
 
+static int bucket_sortcmp(const void* key, const void* item)
+{
+	struct data_bucket** i1 = (struct data_bucket**) key;
+	struct data_bucket** i2 = (struct data_bucket**) item;
+	return strcasecmp( (*i1)->key, (*i2)->key );
+}
+
+static int bucket_cmp(const void* o1, const void* const o2)
+{
+	struct data_bucket* i1 = (struct data_bucket*) o1;
+	struct data_bucket** i2 = (struct data_bucket**) o2;
+	return strcasecmp( i1->key, (*i2)->key );
+}
+
 static int tuple_sortcmp(const void* key, const void* item)
 {
 	struct data_tuple** i1 = (struct data_tuple**) key;
@@ -1431,6 +1471,16 @@ static int tuple_cmp(const void* o1, const void* const o2)
 	fflush( stdout );
 #endif
 	return strcasecmp( i1->key, (*i2)->key );
+}
+
+static void bucket_sort()
+{
+	qsort(
+		buckets,
+		buckets_total,
+		sizeof(struct data_bucket*),
+		bucket_sortcmp
+	);
 }
 
 static void tuple_sort(struct data_tuple* tuples[], int total)
@@ -1827,6 +1877,25 @@ static char* tuple_search(struct data_tuple* tuples[], int total, const char* ar
 	return (char*) (found ? (*found)->value : NULL);
 }
 
+static int get_cached_url(struct connection* conn, const char* arg)
+{
+    struct data_bucket key={ (char*) arg, NULL };
+    struct data_bucket** found = bsearch(
+		&key, buckets, buckets_total,
+		sizeof(struct data_bucket*),
+		bucket_cmp
+	);
+
+	if ( found ) {
+		conn->payload_size = (*found)->size;
+		conn->payload_lastmod = (*found)->lastmod;
+		conn->reply = (*found)->value;
+		conn->reply_start = 0;
+		conn->reply_dont_free = 1;
+	}
+	return found ? 1 : 0;
+}
+
 static char* inisearch(const char* key, const char* deflt)
 {
 	char *value = tuple_search( inivalues, inivalues_total, key );
@@ -2032,18 +2101,80 @@ static int dlent_cmp(const void* a, const void* b)
 		(*((const struct dlent * const*)b))->name);
 }
 
+#ifdef ENABLE_SLOCATE
 /* Make sorted list of files in a directory.
  * Returns number of entries, or -1 if error occurs.
  */
-static ssize_t make_sorted_dirlist(const char* path, struct dlent** *output)
+static ssize_t get_locate_listing(const char* path, struct dlent** *output, size_t *maxlen)
 {
-	DIR* dir;
+	struct dlent** list = NULL;
+	struct dirent* ent;
+    char cmd[2048]={'\0'};
+	size_t entries = 0;
+	size_t pool = 128;
+    FILE *proc = NULL;
+
+    sprintf(
+        cmd,
+        "slocate -q -i -d %s -n %s \"%s\"",
+        locate_dbpath, 
+        locate_maxhits,
+        path
+    );
+
+    proc = popen( cmd, "r" );
+
+    if ( proc ) {
+        char *curname = xmalloc( 4096 );
+        size_t chrs = 0;
+		struct stat s;
+
+        while ( !feof(proc) && !ferror(proc) ) {
+
+            if (getline( &curname, &chrs, proc ) > 0) {
+
+		        if (stat(curname, &s) == -1)
+		        { continue; } /* skip un-stat-able files */
+
+                if (*maxlen < chrs) { *maxlen = chrs; }
+
+                if (entries == pool) {
+                    pool *= 2;
+                    list = xrealloc(list, sizeof(struct dlent*) * pool);
+                }
+
+                list[entries] = xmalloc(sizeof(struct dlent));
+                list[entries]->name = xstrdup( curname );
+                list[entries]->is_dir = S_ISDIR(s.st_mode);
+                list[entries]->size = s.st_size;
+                entries++;
+            }
+        }
+        free(curname);
+        pclose( proc );
+    }
+
+	qsort(list, entries, sizeof(struct dlent*), dlent_cmp);
+
+	*output = list;
+
+	return (ssize_t)entries;
+}
+#endif /* _ENABLE_SLOCATE_ */
+
+/* Make sorted list of files in a directory.
+ * Returns number of entries, or -1 if error occurs.
+ */
+static ssize_t make_sorted_dirlist(const char* path, struct dlent** *output, size_t *maxlen)
+{
 	struct dirent* ent;
 	size_t entries = 0;
 	size_t pool = 128;
+	size_t slen = 0;
 	char* currname;
 	struct dlent** list = NULL;
-	dir = opendir(path);
+	DIR* dir = opendir(path);
+	size_t rlen = strlen(path);
 
 	if (dir == NULL) { return -1; }
 
@@ -2052,16 +2183,20 @@ static ssize_t make_sorted_dirlist(const char* path, struct dlent** *output)
 
 	/* construct list */
 	while ((ent = readdir(dir)) != NULL) {
+
 		struct stat s;
 
 		if ((ent->d_name[0] == '.') && (ent->d_name[1] == '\0'))
 		{ continue; } /* skip "." */
 
-		assert(strlen(ent->d_name) <= MAXNAMLEN);
+		slen = strlen(ent->d_name);
+		assert(sen <= MAXNAMLEN);
 		sprintf(currname, "%s%s", path, ent->d_name);
 
 		if (stat(currname, &s) == -1)
 		{ continue; } /* skip un-stat-able files */
+
+        if (*maxlen < slen+rlen) { *maxlen = slen+rlen; }
 
 		if (entries == pool) {
 			pool *= 2;
@@ -2140,25 +2275,47 @@ static void urlencode(const char* src, char* dest)
 static void generate_dir_listing(struct connection* conn, const char* path)
 {
 	char date[DATE_LEN], *spaces;
+	char *hdr = hdrsearch( conn, "Accept" );
 	struct dlent** list;
 	ssize_t listsize;
 	size_t maxlen = 2; /* There has to be ".." */
-	int i;
 	struct apbuf* listing;
-	listsize = make_sorted_dirlist(path, &list);
+	int i = 0;
 
-	if (listsize == -1) {
-		default_reply(conn, 500, "Internal Server Error",
-		              "Couldn't list directory: %s", strerror(errno));
-		return;
-	}
+#ifdef ENABLE_SLOCATE
+	if (hdr && !strcasecmp( hdr, "text/tsv" )) {
+        if ( !locate_dbpath || !locate_maxhits ) {
+            default_reply(conn, 500, "Internal Server Error",
+                "Search mode must be enabled");
+            return;
+        }
 
-	for (i = 0; i < listsize; i++) {
-		size_t tmp = strlen(list[i]->name);
+	    listsize = get_locate_listing(path, &list, &maxlen);
 
-		if (maxlen < tmp)
-		{ maxlen = tmp; }
-	}
+        if (listsize == -1) {
+            default_reply(conn, 500, "Internal Server Error",
+                "No hits found for %s", path);
+            return;
+        }
+    } else {
+#endif /* ENABLE_SLOCATE */
+	    listsize = make_sorted_dirlist(path, &list, &maxlen);
+
+        if (listsize == -1) {
+            default_reply(conn, 500, "Internal Server Error",
+                "Couldn't list directory: %s", strerror(errno));
+            return;
+        }
+
+        /*
+        for (i = 0; i < listsize; i++) {
+            size_t tmp = strlen(list[i]->name);
+            if (maxlen < tmp) { maxlen = tmp; }
+        }
+        */
+#ifdef ENABLE_SLOCATE
+    }
+#endif /* ENABLE_SLOCATE */
 
 	listing = make_apbuf();
 	append(listing, "<html>\n<head>\n <title>");
@@ -2166,6 +2323,7 @@ static void generate_dir_listing(struct connection* conn, const char* path)
 	append(listing, "</title>\n</head>\n<body>\n<h1>");
 	append(listing, conn->url);
 	append(listing, "</h1>\n<tt><pre>\n");
+
 	spaces = xmalloc(maxlen);
 	memset(spaces, ' ', maxlen);
 
@@ -2175,15 +2333,16 @@ static void generate_dir_listing(struct connection* conn, const char* path)
 		 */
 		char safe_url[MAXNAMLEN * 3 + 1];
 		urlencode(list[i]->name, safe_url);
+
 		append(listing, "<a href=\"");
 		append(listing, safe_url);
 		append(listing, "\">");
 		append(listing, list[i]->name);
 		append(listing, "</a>");
 
-		if (list[i]->is_dir)
-		{ append(listing, "/\n"); }
-		else {
+		if (list[i]->is_dir) {
+            append(listing, "/\n");
+        } else {
 			appendl(listing, spaces, maxlen - strlen(list[i]->name));
 			appendf(listing, "%10llu\n", llu(list[i]->size));
 		}
@@ -2192,13 +2351,16 @@ static void generate_dir_listing(struct connection* conn, const char* path)
 	cleanup_sorted_dirlist(list, listsize);
 	free(list);
 	free(spaces);
+
 	append(listing, "</pre></tt>\n" "<hr>\n");
 	rfc1123_date(date, now);
 	append(listing, generated_on(date));
 	append(listing, "</body>\n</html>\n");
+
 	conn->reply = listing->str;
 	conn->reply_length = (off_t)listing->length;
 	free(listing); /* don't free inside of listing */
+
 	conn->header_length = xasprintf(&(conn->header),
         "HTTP/1.1 200 OK\r\n"
         "Date: %s\r\n"
@@ -2277,7 +2439,9 @@ static void process_get(struct connection* conn)
 	const char* mimetype = NULL;
 	const char* forward_to = NULL;
 	struct stat filestat;
+	int slash_path = 0;
 	size_t i=0;
+	int rc = 0;
 
 	/* work out path of file being requested */
 	char* decoded_url = decode_url(conn);
@@ -2305,7 +2469,9 @@ static void process_get(struct connection* conn)
 	}
 
 	/* does it end in a slash? serve up url/index_name */
-	if (decoded_url[strlen(decoded_url) - 1] == '/') {
+	slash_path = decoded_url[strlen(decoded_url) - 1] == '/';
+
+	if (slash_path) {
 
 		xasprintf(&target, "%s%s%s", wwwroot, decoded_url, index_name);
 
@@ -2325,6 +2491,7 @@ static void process_get(struct connection* conn)
 			xasprintf(&target, "%s%s", wwwroot, decoded_url);
 			generate_dir_listing(conn, target);
 			free(target);
+
 			return;
 		}
 		mimetype = url_content_type(index_name);
@@ -2335,48 +2502,63 @@ static void process_get(struct connection* conn)
 		mimetype = url_content_type(decoded_url);
 	}
 
-	/* open file */
-	conn->reply_fd = open(target, O_RDONLY | O_NONBLOCK);
-	free(target);
+	/* check if url was cached */
+	rc = get_cached_url( conn, target+wwwrootlen );
 
-	if (conn->reply_fd == -1) {
-		/* open() failed */
-		if (errno == EACCES) {
-			default_reply(conn, 403, "Forbidden",
-			    "You don't have permission to access (%s).", conn->url);
+	if ( rc ) {
+		conn->header_only = 0;
+		conn->reply_type = REPLY_CACHED;
+		free(target);
+	}
+	else {
+
+		/* open file */
+		conn->reply_fd = open(target, O_RDONLY|O_NONBLOCK );
+		free(target);
+
+		if (conn->reply_fd == -1) {
+
+			/* open() failed */
+			if (errno == EACCES) {
+				default_reply(conn, 403, "Forbidden",
+					"You don't have permission to access (%s).", conn->url);
+			}
+			else if (errno == ENOENT) {
+				default_reply(conn, 404, "Not Found",
+					"The URL you requested (%s) was not found.", conn->url);
+			}
+			else {
+				default_reply(conn, 500, "Internal Server Error",
+					"The URL you requested (%s) cannot be returned: %s.",
+				conn->url, strerror(errno));
+			}
+
+			return;
 		}
-		else if (errno == ENOENT) {
-			default_reply(conn, 404, "Not Found",
-			    "The URL you requested (%s) was not found.", conn->url);
-		}
-		else {
+
+		/* stat the file */
+		if (fstat(conn->reply_fd, &filestat) == -1) {
 			default_reply(conn, 500, "Internal Server Error",
-			    "The URL you requested (%s) cannot be returned: %s.",
-			conn->url, strerror(errno));
+			    "fstat() failed: %s.", strerror(errno));
+			return;
 		}
 
-		return;
+		/* make sure it's a regular file */
+		if (S_ISDIR(filestat.st_mode)) {
+			redirect(conn, "%s/", conn->url);
+			return;
+		}
+		else if (!S_ISREG(filestat.st_mode)) {
+			default_reply(conn, 403, "Forbidden", "Not a regular file.");
+			return;
+		}
+
+		conn->payload_size = filestat.st_size;
+		conn->payload_lastmod = filestat.st_mtime;
+		conn->reply_type = REPLY_FROMFILE;
 	}
 
-	/* stat the file */
-	if (fstat(conn->reply_fd, &filestat) == -1) {
-		default_reply(conn, 500, "Internal Server Error",
-		              "fstat() failed: %s.", strerror(errno));
-		return;
-	}
-
-	/* make sure it's a regular file */
-	if (S_ISDIR(filestat.st_mode)) {
-		redirect(conn, "%s/", conn->url);
-		return;
-	}
-	else if (!S_ISREG(filestat.st_mode)) {
-		default_reply(conn, 403, "Forbidden", "Not a regular file.");
-		return;
-	}
-
-	conn->reply_type = REPLY_FROMFILE;
-	rfc1123_date(lastmod, filestat.st_mtime);
+	rfc1123_date(lastmod, conn->payload_lastmod);
 
 	/* check for If-Modified-Since, may not have to send */
 	if_mod_since = hdrsearch( conn, "If-Modified-Since" );
@@ -2410,17 +2592,17 @@ static void process_get(struct connection* conn)
 			to = conn->range_end;
 
 			/* clamp end to filestat.st_size-1 */
-			if (to > (filestat.st_size - 1))
-			{ to = filestat.st_size - 1; }
+			if (to > (conn->payload_size - 1))
+			{ to = conn->payload_size - 1; }
 		}
 		else if (conn->range_begin_given && !conn->range_end_given) {
 			/* 100- :: yields 100 to end */
 			from = conn->range_begin;
-			to = filestat.st_size - 1;
+			to = conn->payload_size - 1;
 		}
 		else if (!conn->range_begin_given && conn->range_end_given) {
 			/* -200 :: yields last 200 */
-			to = filestat.st_size - 1;
+			to = conn->payload_size - 1;
 			from = to - conn->range_end + 1;
 
 			/* clamp start */
@@ -2430,7 +2612,7 @@ static void process_get(struct connection* conn)
 		else
 		{ errx(1, "internal error - from/to mismatch"); }
 
-		if (from >= filestat.st_size) {
+		if (from >= conn->payload_size) {
 			default_reply(conn, 416, "Requested Range Not Satisfiable",
 			    "You requested a range outside of the file.");
 			return;
@@ -2458,19 +2640,19 @@ static void process_get(struct connection* conn)
             ,
             rfc1123_date(date, now), server_hdr, keep_alive(conn),
             llu(conn->reply_length), llu(from), llu(to),
-            llu(filestat.st_size), mimetype, lastmod
+            llu(conn->payload_size), mimetype, lastmod
         );
 
 		conn->http_code = 206;
 
 		if (debug) {
 			printf("sending %llu-%llu/%llu\n",
-			       llu(from), llu(to), llu(filestat.st_size));
+			       llu(from), llu(to), llu(conn->payload_size));
 		}
 	}
 	else {
 		/* no range stuff */
-		conn->reply_length = filestat.st_size;
+		conn->reply_length = conn->payload_size;
 		conn->header_length = xasprintf(&(conn->header),
             "HTTP/1.1 200 OK\r\n"
             "Date: %s\r\n"
@@ -2682,12 +2864,15 @@ static void poll_recv_request(struct connection* conn)
 static void poll_send_header(struct connection* conn)
 {
 	ssize_t sent;
+
 	assert(conn->state == SEND_HEADER);
 	assert(conn->header_length == strlen(conn->header));
+
 	sent = send(conn->socket,
         conn->header + conn->header_sent,
         conn->header_length - conn->header_sent,
         0);
+
 	conn->last_active = now;
 
 	if (debug) {
@@ -2720,9 +2905,9 @@ static void poll_send_header(struct connection* conn)
 
 	/* check if we're done sending header */
 	if (conn->header_sent == conn->header_length) {
-		if (conn->header_only)
-		{ conn->state = DONE; }
-		else {
+		if (conn->header_only) {
+			conn->state = DONE;
+		} else {
 			conn->state = SEND_REPLY;
 			/* go straight on to body, don't go through another iteration of
 			 * the select() loop.
@@ -2747,14 +2932,16 @@ static ssize_t send_from_file(const int s, const int fd,
 	/* It is possible for sendfile to send zero bytes due to a blocking
 	 * condition.  Handle this correctly.
 	 */
-	if (ret == -1)
-		if (errno == EAGAIN)
+	if (ret == -1) {
+		if (errno == EAGAIN) {
 			if (sent == 0)
 			{ return -1; }
 			else
 			{ return sent; }
+		}
 		else
 		{ return -1; }
+	}
 	else
 	{ return size; }
 
@@ -2762,8 +2949,7 @@ static ssize_t send_from_file(const int s, const int fd,
 #if defined(__linux) || defined(__sun__)
 
 	/* Limit truly ridiculous (LARGEFILE) requests. */
-	if (size > 1 << 20)
-	{ size = 1 << 20; }
+	if (size > 1 << 20) { size = 1 << 20; }
 
 	return sendfile(s, fd, &ofs, size);
 #else
@@ -2804,21 +2990,25 @@ static ssize_t send_from_file(const int s, const int fd,
 static void poll_send_reply(struct connection* conn)
 {
 	ssize_t sent;
+
 	assert(conn->state == SEND_REPLY);
 	assert(!conn->header_only);
 
-	if (conn->reply_type == REPLY_GENERATED) {
+	errno = 0;
+
+	if (conn->reply_type == REPLY_CACHED ||
+		conn->reply_type == REPLY_GENERATED)
+	{
 		assert(conn->reply_length >= conn->reply_sent);
 		sent = send(conn->socket,
-		            conn->reply + conn->reply_start + conn->reply_sent,
-		            (size_t)(conn->reply_length - conn->reply_sent), 0);
+			conn->reply + conn->reply_start + conn->reply_sent,
+			(size_t)(conn->reply_length - conn->reply_sent), 0);
 	}
 	else {
-		errno = 0;
 		assert(conn->reply_length >= conn->reply_sent);
 		sent = send_from_file(conn->socket, conn->reply_fd,
-		                      conn->reply_start + conn->reply_sent,
-		                      (size_t)(conn->reply_length - conn->reply_sent));
+			  conn->reply_start + conn->reply_sent,
+			  (size_t)(conn->reply_length - conn->reply_sent));
 
 		if (debug && (sent < 1)) {
 			printf("send_from_file returned %lld (errno=%d %s)\n",
@@ -2863,8 +3053,9 @@ static void poll_send_reply(struct connection* conn)
 	total_out += (size_t)sent;
 
 	/* check if we're done sending */
-	if (conn->reply_sent == conn->reply_length)
-	{ conn->state = DONE; }
+	if (conn->reply_sent == conn->reply_length) {
+		conn->state = DONE;
+	}
 }
 
 /* Main loop of the httpd - a select() and then delegation to accept
@@ -2877,6 +3068,7 @@ static void httpd_poll(void)
 	struct connection* conn, *next;
 	int bother_with_timeout = 0;
 	struct timeval timeout;
+
 	timeout.tv_sec = idletime;
 	timeout.tv_usec = 0;
 	FD_ZERO(&recv_set);
@@ -2886,7 +3078,9 @@ static void httpd_poll(void)
 #define MAX_FD_SET(sock, fdset) { FD_SET(sock,fdset); \
                                 max_fd = (max_fd<sock) ? sock : max_fd; }
 	MAX_FD_SET(sockin, &recv_set);
+
 	LIST_FOREACH_SAFE(conn, &connlist, entries, next) {
+
 		poll_check_timeout(conn);
 
 		switch (conn->state) {
@@ -2906,10 +3100,11 @@ static void httpd_poll(void)
 			break;
 		}
 	}
+
 #undef MAX_FD_SET
 	/* -select- */
 	select_ret = select(max_fd + 1, &recv_set, &send_set, NULL,
-	                    (bother_with_timeout) ? &timeout : NULL);
+		(bother_with_timeout) ? &timeout : NULL);
 
 	if (select_ret == 0) {
 		if (!bother_with_timeout)
@@ -2930,9 +3125,10 @@ static void httpd_poll(void)
 
 	/* poll connections that select() says need attention */
 	if (FD_ISSET(sockin, &recv_set))
-	{ accept_connection(); }
+		accept_connection();
 
 	LIST_FOREACH_SAFE(conn, &connlist, entries, next) {
+
 		switch (conn->state) {
 		case RECV_REQUEST:
 			if (FD_ISSET(conn->socket, &recv_set))
@@ -2958,6 +3154,7 @@ static void httpd_poll(void)
 		}
 
 		if (conn->state == DONE) {
+
 			/* clean out finished connection */
 			if (conn->conn_close) {
 				LIST_REMOVE(conn, entries);
@@ -3099,6 +3296,7 @@ static void pidfile_create(void)
 {
 	int error, fd;
 	char pidstr[16];
+
 	/* Open the PID file and obtain exclusive lock. */
 	fd = open(pidfile_name,
 	     O_WRONLY | O_CREAT | O_EXLOCK | O_TRUNC | O_NONBLOCK, PIDFILE_MODE);
@@ -3172,6 +3370,19 @@ static void parse_commandline(const int argc, char* argv[])
 	if (!wwwroot)
 		errx(1, "No www rootdir specified !" );
 
+	wwwrootlen = strlen(wwwroot);
+
+	locate_dbpath = inisearch( "Locate/path", NULL );
+	locate_maxhits = inisearch( "Locate/maximum", NULL );
+
+	if ( locate_maxhits ) {
+        int max = atoi(locate_maxhits);
+
+        if (max < 50 || max > 2500) {
+			errx(1, "Invalid locate search maximum");
+        }
+    }
+
 	printf( "Using WWWROOT '%s'\n", wwwroot );
 
 	value = inisearch( "General/use-ipv4", "yes" );
@@ -3195,6 +3406,9 @@ static void parse_commandline(const int argc, char* argv[])
 
 	pidfile_name = inisearch( "General/pidfile", NULL );
 	mimefile_name = inisearch( "General/mimetypes", NULL );
+
+	if ((value = inisearch( "General/use-cache", NULL )))
+		want_cache = !strcasecmp( value, "yes" );
 
 	/* walk through the remainder of the arguments (if any) */
 	for (i = optidx; i < argc; i++) {
@@ -3354,6 +3568,54 @@ static void parse_commandline(const int argc, char* argv[])
 	}
 }
 
+void init_buckets()
+{
+	struct stat filestat;
+	char path[256]={'\0'};
+	char key[32]={'\0'};
+	char *fname = NULL;
+	char *buf = NULL;
+    int nread = 0;
+	int i = 0;
+
+	for (i=1; i < MAX_BUCKETS; i++) {
+
+		sprintf( key, "Memcache/%d", i ); 
+
+		fname = inisearch( key, NULL );
+		if ( !fname ) { break; }
+
+		sprintf( path, "%s/%s", wwwroot, fname ); 
+
+		if (lstat( path, &filestat) != 0) {
+            err(1, "failed to stat cache file (\"%s\")", path);
+			break;
+		}
+
+    	nread = load_file( path, &buf, (1 << 15) );
+
+		if (nread < 1) {
+            err(1, "failed to read cache file (\"%s\")", path);
+			break;
+		}
+
+		buckets[i-1] = xmalloc(sizeof(struct data_bucket));
+		buckets[i-1]->key = fname;
+		buckets[i-1]->value = buf;
+		buckets[i-1]->size = nread;
+		buckets[i-1]->lastmod = filestat.st_mtime;
+
+		buf = NULL;
+	}
+
+	buckets_total = i-1;
+
+	if (buckets_total > 1)
+		bucket_sort();
+
+	//fprintf(stderr, "buckets_total %d\n", buckets_total );
+}
+
 /* Execution starts here. */
 int main(int argc, char** argv)
 {
@@ -3381,6 +3643,10 @@ int main(int argc, char** argv)
     }
 
 	init_sockin();
+
+	if ( want_cache ) {
+		init_buckets();
+	}
 
 	if ( want_daemon ) {
         daemonize_start();

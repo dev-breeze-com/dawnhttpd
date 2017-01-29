@@ -2,11 +2,12 @@ README
 ======
 
    1. Introduction
-   2. Building
-   3. Configuraton
-   4. Bugs
-   5. Fun facts
-   6. Authors
+   2. Features
+   3. Building
+   4. Configuraton
+   5. Bugs
+   6. Fun facts
+   7. Authors
 
 
 INTRODUCTION
@@ -20,12 +21,23 @@ INTRODUCTION
    It compiles and runs on 32 and 64 bits computers.
 
 
+FEATURES
+========
+
+   - INI-style configuration.
+   - MIME type based handlers.
+   - Support for guestboooks.
+   - Support for basic memory cache.
+   - Support for slocate requests.
+
+
 BUILDING
 ========
 
-   Install dawnhttpd by running the following commands, as root:
-   make && make install
-   copy settings.ini to /etc/dawnhttpd/
+   Enable slocate by including -DENABLE_SLOCATE in the Makefile CFLAGS.  
+   Install dawnhttpd by running the following commands, as root:  
+	   make && make install  
+	   copy settings.ini to /etc/dawnhttpd/
 
 
 CONFIGURATION
@@ -42,10 +54,10 @@ BUGS
    Strange bug in the tuple_cmp function. Debug to see if it occurs 
    on your computer, where the const parameter o2 gets reset to NULL.
    Bug reports, patches and suggestions are much appreciated.  
-   See the GitHub account https://www.github.com/dev-breeze-com/dawnhttpd
+   See GitHub account https://www.github.com/dev-breeze-com/dawnhttpd
 
 
-Fun Facts
+FUN FACTS
 ========= 
 
    On an AMD Athlon64 X2 (Mem 1G) running Linux 3.10.104-amd64, we get  
