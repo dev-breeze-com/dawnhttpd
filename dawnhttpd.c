@@ -21,7 +21,7 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
-static const char pkgname[] = "dawnhttpd/1.2.0";
+static const char pkgname[] = "dawnhttpd/1.3.0";
 static const char copyright[] = "copyright (c) 2016 Tsert.Com";
 
 /* Possible build options: -DDEBUG -DNO_IPV6 */
@@ -97,7 +97,11 @@ static const int debug = 1;
 #define MAX_HEADERS 20
 #define MAX_TUPLES  100
 #define MAX_MIMES   500
-#define MAX_BUCKETS 17
+#define MAX_CACHE	17
+
+#ifndef MAX_BUFSZ
+# define MAX_BUFSZ 4096
+#endif
 
 #if defined(O_EXCL) && !defined(O_EXLOCK)
 # define O_EXLOCK O_EXCL
@@ -266,6 +270,7 @@ struct connection {
 	char* request;
 	size_t request_length;
 	size_t content_len;
+	size_t urllen,decoded_urllen;
 
 	/* request fields */
 	char* method, *url, *decoded_url;
@@ -311,11 +316,11 @@ static struct data_tuple* mimetypes[MAX_MIMES];
 static int mimetypes_total = 0;
 
 static char *inibuf = NULL;
-static struct data_tuple* inivalues[MAX_TUPLES];
-static int inivalues_total = 0;
+static struct data_tuple* inifile[MAX_TUPLES];
+static int inifile_total = 0;
 
-static struct data_bucket* buckets[MAX_BUCKETS];
-static int buckets_total = 0;
+static struct data_bucket* memcache[MAX_CACHE];
+static int memcache_total = 0;
 
 static size_t longest_ext = 0;
 
@@ -336,6 +341,7 @@ static const char* bindaddr = NULL;
 static uint16_t bindport = 8080; /* or 80 if running as root */
 static int max_connections = -1; /* kern.ipc.somaxconn */
 
+static size_t index_name_len = 10;
 static const char* index_name = "index.html";
 static const char* postfile_name = NULL;
 static const char* mimefile_name = NULL;
@@ -367,6 +373,7 @@ static int wwwrootlen = 0;
 static uint64_t total_in = 0;
 static uint64_t total_out = 0;
 static uint64_t num_requests = 0;
+static uint64_t num_connections = 0;
 
 static volatile int running = 1; /* signal handler sets this to false */
 
@@ -455,6 +462,43 @@ static char* xstrdup(const char* src)
 	char* dest = xmalloc(len);
 	memcpy(dest, src, len);
 	return dest;
+}
+
+/* Returns 1 if string is a number, 0 otherwise.  Set num to NULL if
+ * disinterested in value.
+ */
+static int str_to_num(const char* str, long long* num)
+{
+	char* endptr;
+	long long n;
+	errno = 0;
+	n = strtoll(str, &endptr, 10);
+
+	if (*endptr != '\0')
+	{ return 0; }
+
+	if (n == LLONG_MIN && errno == ERANGE)
+	{ return 0; }
+
+	if (n == LLONG_MAX && errno == ERANGE)
+	{ return 0; }
+
+	if (num != NULL)
+	{ *num = n; }
+
+	return 1;
+}
+
+/* Returns a valid number or dies. */
+static long long xstr_to_num(const char* str)
+{
+	long long ret;
+
+	if (!str_to_num(str, &ret)) {
+		errx(1, "number \"%s\" is invalid", str);
+	}
+
+	return ret;
 }
 
 #ifdef __sun /* unimpressed by Solaris */
@@ -581,12 +625,12 @@ static char* split_string(const char* src,
 	char* dest;
 
 	assert(left <= right);
-	assert(left < strlen(src));   /* [left means must be smaller */
-	assert(right <= strlen(src)); /* right) means can be equal or smaller */
+	//assert(left < strlen(src));   /* [left means must be smaller */
+	//assert(right <= strlen(src)); /* right) means can be equal or smaller */
 
 	dest = xmalloc(right - left + 1);
-	memcpy(dest, src + left, right - left);
-	dest[right - left] = '\0';
+	memcpy( dest, src + left, right - left );
+	dest[right-left] = '\0';
 
 	return dest;
 }
@@ -594,7 +638,7 @@ static char* split_string(const char* src,
 /* Consolidate slashes in-place by shifting parts of the string over
  * repeated slashes.
  */
-static void consolidate_slashes(char* s)
+static void consolidate_slashes(char* s, size_t *urllen)
 {
 	size_t left = 0, right = 0;
 	int saw_slash = 0;
@@ -618,20 +662,23 @@ static void consolidate_slashes(char* s)
 	}
 
 	s[left] = '\0';
+	(*urllen) = left;
 }
 
 /* Resolve /./ and /../ in a URL, in-place.  Also strip out query params.
  * Returns NULL if the URL is invalid/unsafe, or the original buffer if
  * successful.
  */
-static char* make_safe_url(char* url)
+static int make_safe_url(struct connection* conn)
 {
 	struct {
 		char* start;
 		size_t len;
 	} *chunks;
+
 	unsigned int num_slashes, num_chunks;
 	size_t urllen, i, j, pos;
+	char *url = conn->decoded_url;
 	int ends_in_slash;
 
 	/* strip query params */
@@ -643,10 +690,9 @@ static char* make_safe_url(char* url)
 	}
 
 	if (url[0] != '/')
-	{ return NULL; }
+	{ return (0); }
 
-	consolidate_slashes(url);
-	urllen = strlen(url);
+	consolidate_slashes(url, &urllen);
 
 	if (urllen > 0)
 	{ ends_in_slash = (url[urllen - 1] == '/'); }
@@ -677,7 +723,8 @@ static char* make_safe_url(char* url)
 			if (num_chunks == 0) {
 				/* unsafe string so free chunks */
 				free(chunks);
-				return (NULL);
+				return (0);
+				//return (NULL);
 			}
 			else
 			{ num_chunks--; }
@@ -712,8 +759,13 @@ static char* make_safe_url(char* url)
 	{ url[pos++] = '/'; }
 
 	assert(pos <= urllen);
+
 	url[pos] = '\0';
-	return url;
+
+	//conn->decoded_url = url;
+	conn->decoded_urllen = pos;
+
+	return (1);
 }
 
 static int add_redirect(const char* const host, const char* const url)
@@ -743,6 +795,93 @@ static const char* get_address_text(const void* addr)
 	}
 }
 
+static int bucket_sortcmp(const void* key, const void* item)
+{
+	struct data_bucket** i1 = (struct data_bucket**) key;
+	struct data_bucket** i2 = (struct data_bucket**) item;
+	return strcasecmp( (*i1)->key, (*i2)->key );
+}
+
+static int bucket_cmp(const void* o1, const void* const o2)
+{
+	struct data_bucket* i1 = (struct data_bucket*) o1;
+	struct data_bucket** i2 = (struct data_bucket**) o2;
+	return strcasecmp( i1->key, (*i2)->key );
+}
+
+static int tuple_sortcmp(const void* key, const void* item)
+{
+	struct data_tuple** i1 = (struct data_tuple**) key;
+	struct data_tuple** i2 = (struct data_tuple**) item;
+	return strcasecmp( (*i1)->key, (*i2)->key );
+}
+
+static int tuple_cmp(const void* o1, const void* const o2)
+{
+	struct data_tuple* i1 = (struct data_tuple*) o1;
+	struct data_tuple** i2 = (struct data_tuple**) o2;
+
+#ifdef DEBUG
+    // To check out a problem I encountered, where the parameter 'o2'
+    // get re-assigned a null value, after the second assignment;
+    printf( "tuple_cmp[1]: 0x%x 0x%x 0x%x 0x%x\n", i1, i2, (*i2), o2 );
+	fflush( stdout );
+	struct data_tuple* i3 = (struct data_tuple*) o2; /* BUG HERE */
+    printf( "tuple_cmp[2]: 0x%x 0x%x 0x%x 0x%x\n", i1, i3, (*i3), o2 );
+    //printf( "tuple_cmp[3]: '%s' '%s'\n", i1->key, (*i2)->key );
+	fflush( stdout );
+#endif
+	return strcasecmp( i1->key, (*i2)->key );
+}
+
+static void bucket_sort()
+{
+	qsort(
+		memcache,
+		memcache_total,
+		sizeof(struct data_bucket*),
+		bucket_sortcmp
+	);
+}
+
+static void tuple_sort(struct data_tuple* tuples[], int total)
+{
+	qsort( tuples, total, sizeof(struct data_tuple*), tuple_sortcmp );
+}
+
+static char* tuple_search(struct data_tuple* tuples[], int total, const char* arg)
+{
+    struct data_tuple key={ (char*) arg, NULL };
+    struct data_tuple** found = bsearch(
+		&key, tuples, total,
+		sizeof(struct data_tuple*),
+		tuple_cmp
+	);
+	return (char*) (found ? (*found)->value : NULL);
+}
+
+static char* htpasswd(const char* user, const char* password)
+{
+	char *crypted = tuple_search( passwords, passwords_total, user );
+    return crypted;
+}
+
+static char* pwdsearch(const char* arg)
+{
+	return tuple_search( passwords, passwords_total, arg );
+}
+
+static char* hdrsearch(struct connection* conn, const char* arg)
+{
+	return tuple_search( conn->headers, conn->headers_total, arg );
+}
+
+static char* inisearch(const char* key, const char* deflt)
+{
+	char *value = tuple_search( inifile, inifile_total, key );
+	return value ? value : (char*) deflt;
+}
+
 /* Initialize the sockin global.  This is the socket that we accept
  * connections from.
  */
@@ -753,9 +892,21 @@ static void init_sockin(void)
 	struct sockaddr_in6 addrin6;
 #endif
 	socklen_t addrin_len;
-	int sockopt;
-#ifdef HAVE_INET6
+	char *value = NULL;
+	int sockopt = 0;
+	//int delay = 1;
+	int i = 0;
 
+	/*
+	if ( want_daemon ) {
+		value = inisearch( "General/bind-delay", "5" );
+		delay = (int)xstr_to_num( value );
+		delay = delay > 5 ? 5 : delay;
+		delay = delay < 0 ? 0 : delay;
+	}
+	*/
+
+#ifdef HAVE_INET6
 	if (use_inet6) {
 		memset(&addrin6, 0, sizeof(addrin6));
 
@@ -763,6 +914,17 @@ static void init_sockin(void)
 			errx(1, "malformed --addr argument");
 		}
 
+#if 0
+		if ( want_daemon ) {
+			for (i=0; i < delay; i++) {
+				sockin = socket(PF_INET6, SOCK_STREAM, 0);
+				if (sockin > 0) break;
+				sleep(1);
+			}
+		} else {
+			sockin = socket(PF_INET6, SOCK_STREAM, 0);
+		}
+#endif
 		sockin = socket(PF_INET6, SOCK_STREAM, 0);
 	}
 	else
@@ -775,6 +937,17 @@ static void init_sockin(void)
 		if (addrin.sin_addr.s_addr == (in_addr_t)INADDR_NONE)
 		{ errx(1, "malformed --addr argument"); }
 
+#if 0
+		if ( want_daemon ) {
+			for (i=0; i < delay; i++) {
+				sockin = socket(PF_INET, SOCK_STREAM, 0);
+				if (sockin > 0) break;
+				sleep(1);
+			}
+		} else {
+			sockin = socket(PF_INET, SOCK_STREAM, 0);
+		}
+#endif
 		sockin = socket(PF_INET, SOCK_STREAM, 0);
 	}
 
@@ -821,7 +994,7 @@ static void init_sockin(void)
 		if (getsockname(sockin, (struct sockaddr*)&addrin6, &addrin_len) == -1)
 		{ err(1, "getsockname()"); }
 
-		printf("listening on: http://[%s]:%u/\n",
+		fprintf( logfile, "listening on: http://[%s]:%u/\n",
             get_address_text(&addrin6.sin6_addr), bindport);
 	}
 	else
@@ -839,7 +1012,7 @@ static void init_sockin(void)
 		if (getsockname(sockin, (struct sockaddr*)&addrin, &addrin_len) == -1)
 		{ err(1, "getsockname()"); }
 
-		printf("listening on: http://%s:%u/\n",
+		fprintf( logfile, "listening on: http://%s:%u/\n",
             get_address_text(&addrin.sin_addr), bindport);
 	}
 
@@ -925,47 +1098,12 @@ static void usage(const char* argv0)
 #endif
 }
 
-/* Returns 1 if string is a number, 0 otherwise.  Set num to NULL if
- * disinterested in value.
- */
-static int str_to_num(const char* str, long long* num)
-{
-	char* endptr;
-	long long n;
-	errno = 0;
-	n = strtoll(str, &endptr, 10);
-
-	if (*endptr != '\0')
-	{ return 0; }
-
-	if (n == LLONG_MIN && errno == ERANGE)
-	{ return 0; }
-
-	if (n == LLONG_MAX && errno == ERANGE)
-	{ return 0; }
-
-	if (num != NULL)
-	{ *num = n; }
-
-	return 1;
-}
-
-/* Returns a valid number or dies. */
-static long long xstr_to_num(const char* str)
-{
-	long long ret;
-
-	if (!str_to_num(str, &ret)) {
-		errx(1, "number \"%s\" is invalid", str);
-	}
-
-	return ret;
-}
-
 /* Allocate and initialize an empty connection. */
 static struct connection* new_connection(void)
 {
 	struct connection* conn = xmalloc(sizeof(struct connection));
+
+	num_connections += 1;
 
 	memset(&conn->client, 0, sizeof(conn->client) );
 
@@ -1064,7 +1202,7 @@ static void accept_connection(void)
 
 	if (debug) {
 		printf("accepted connection from %s:%u\n",
-		       inet_ntoa(addrin.sin_addr), ntohs(addrin.sin_port));
+			inet_ntoa(addrin.sin_addr), ntohs(addrin.sin_port));
 	}
 
 	/* Try to read straight away rather than going through another iteration
@@ -1092,17 +1230,17 @@ static void logencode(const char* src, char* dest)
 			dest[j++] = '%';
 			dest[j++] = hex[(src[i] >> 4) & 0xF];
 			dest[j++] = hex[ src[i]       & 0xF];
+		} else {
+			dest[j++] = src[i];
 		}
-		else
-		{ dest[j++] = src[i]; }
 	}
-
 	dest[j] = '\0';
 }
 
 static void log_connection(const struct connection* conn)
 {
-	char* safe_method, *safe_url, *safe_referer, *safe_user_agent;
+	char* safe_referer, *safe_user_agent, *safe_url;
+	//char* safe_method
 
 	if (logfile == NULL) { return; }
 
@@ -1112,6 +1250,8 @@ static void log_connection(const struct connection* conn)
 	/* invalid - didn't parse - maybe too long */
 	if (conn->method == NULL) { return; }
 
+    //fprintf( logfile, "Len=%d\n", strlen(conn->x));
+
 #define make_safe(x) \
     if (conn->x) { \
         safe_##x = xmalloc(strlen(conn->x)*3 + 1); \
@@ -1119,7 +1259,8 @@ static void log_connection(const struct connection* conn)
     } else { \
         safe_##x = NULL; \
     }
-	make_safe(method);
+
+	//make_safe(method);
 	make_safe(url);
 	make_safe(referer);
 	make_safe(user_agent);
@@ -1128,9 +1269,11 @@ static void log_connection(const struct connection* conn)
 	fprintf(logfile, "%lu %s \"%s %s\" %d %llu \"%s\" \"%s\"\n",
 	        (unsigned long int)now,
 	        get_address_text(&conn->client),
-	        use_safe(method),
+	        conn->method,
+	        //use_safe(method),
 	        use_safe(url),
 	        conn->http_code,
+	        //num_connections,
 	        llu(conn->total_sent),
 	        use_safe(referer),
 	        use_safe(user_agent)
@@ -1138,7 +1281,7 @@ static void log_connection(const struct connection* conn)
 	fflush(logfile);
 
 #define free_safe(x) if (safe_##x) free(safe_##x);
-	free_safe(method);
+	//free_safe(method);
 	free_safe(url);
 	free_safe(referer);
 	free_safe(user_agent);
@@ -1259,7 +1402,8 @@ static void poll_check_timeout(struct connection* conn)
 	if (idletime > 0) { /* optimised away by compiler */
 		if ((now - conn->last_active) >= idletime) {
 			if (debug) {
-				printf(
+				fprintf(
+					logfile,
 					"poll_check_timeout(%d) caused closure\n",
 					conn->socket
 				);
@@ -1288,10 +1432,12 @@ static char* rfc1123_date(char* dest, const time_t when)
 /* Decode URL by converting %XX (where XX are hexadecimal digits) to the
  * character it represents.  Don't forget to free the return value.
  */
-static char* urldecode(const char* url)
+static void urldecode(struct connection* conn)
 {
-	size_t i, pos, len = strlen(url);
-	char* out = xmalloc(len + 1);
+	size_t i, pos;
+	size_t len = conn->urllen;
+	char* out = xmalloc( len+1 );
+	char* url = conn->url;
 
 	for (i = 0, pos = 0; i < len; i++) {
 		if ((url[i] == '%') && (i + 2 < len) &&
@@ -1306,14 +1452,18 @@ static char* urldecode(const char* url)
 			i += 2;
 #undef HEX_TO_DIGIT
 		}
-		else {
+		else if (url[i] == '/' && url[i+1] == '/') {
+			//skip;
+		} else {
 			/* straight copy */
 			out[pos++] = url[i];
 		}
 	}
 
 	out[pos] = '\0';
-	return out;
+	conn->decoded_url = out;
+	conn->decoded_urllen = pos;
+	//fprintf( logfile, "LEN=%d %d\n", pos, strlen(conn->decoded_url));
 }
 
 /* Returns Connection or Keep-Alive header, depending on conn_close. */
@@ -1421,71 +1571,17 @@ static void redirect(struct connection* conn, const char* format, ...)
 
 static char* decode_url(struct connection* conn)
 {
-	/* work out path of file being requested */
-	conn->decoded_url = urldecode( conn->url );
+	/* Work out path of file being requested */
+	urldecode( conn );
 
-	/* make sure it's safe */
-	if (make_safe_url( conn->decoded_url ) == NULL) {
+	/* Make sure it's safe */
+	if (!make_safe_url( conn ))
+	{
 		default_reply(conn, 400, "Bad Request",
 		     "You requested an invalid URL: %s", conn->url);
 		return NULL;
 	}
-
 	return conn->decoded_url;
-}
-
-static int bucket_sortcmp(const void* key, const void* item)
-{
-	struct data_bucket** i1 = (struct data_bucket**) key;
-	struct data_bucket** i2 = (struct data_bucket**) item;
-	return strcasecmp( (*i1)->key, (*i2)->key );
-}
-
-static int bucket_cmp(const void* o1, const void* const o2)
-{
-	struct data_bucket* i1 = (struct data_bucket*) o1;
-	struct data_bucket** i2 = (struct data_bucket**) o2;
-	return strcasecmp( i1->key, (*i2)->key );
-}
-
-static int tuple_sortcmp(const void* key, const void* item)
-{
-	struct data_tuple** i1 = (struct data_tuple**) key;
-	struct data_tuple** i2 = (struct data_tuple**) item;
-	return strcasecmp( (*i1)->key, (*i2)->key );
-}
-
-static int tuple_cmp(const void* o1, const void* const o2)
-{
-	struct data_tuple* i1 = (struct data_tuple*) o1;
-	struct data_tuple** i2 = (struct data_tuple**) o2;
-
-#ifdef DEBUG
-    // To check out a problem I encountered, where the parameter 'o2'
-    // get re-assigned a null value, after the second assignment;
-    printf( "tuple_cmp[1]: 0x%x 0x%x 0x%x 0x%x\n", i1, i2, (*i2), o2 );
-	fflush( stdout );
-	struct data_tuple* i3 = (struct data_tuple*) o2; /* BUG HERE */
-    printf( "tuple_cmp[2]: 0x%x 0x%x 0x%x 0x%x\n", i1, i3, (*i3), o2 );
-    //printf( "tuple_cmp[3]: '%s' '%s'\n", i1->key, (*i2)->key );
-	fflush( stdout );
-#endif
-	return strcasecmp( i1->key, (*i2)->key );
-}
-
-static void bucket_sort()
-{
-	qsort(
-		buckets,
-		buckets_total,
-		sizeof(struct data_bucket*),
-		bucket_sortcmp
-	);
-}
-
-static void tuple_sort(struct data_tuple* tuples[], int total)
-{
-	qsort( tuples, total, sizeof(struct data_tuple*), tuple_sortcmp );
 }
 
 static int dir_exists(const char* path)
@@ -1598,8 +1694,8 @@ static int parse_tuples(struct connection* conn, struct data_tuple* tuples[],
     int seqlen = 0;
     int slen = 0;
 
-    if (debug && for_hdr)
-    { printf("Buffer: '%s'\n", buffer); }
+	if (debug && for_hdr)
+    { fprintf( logfile, "Buffer: '%s'\n", buffer); }
 
 	for (; (*sptr); sptr++) {
 
@@ -1817,7 +1913,7 @@ static int load_file(const char* filename, char** buffer, int maximum)
 	int i = 0;
 
 	if (debug) {
-		printf("load_file: file size=%d max=%d\n", sz, maximum );
+		fprintf( logfile, "load_file: file size=%d max=%d\n", sz, maximum );
 	}
 
     if (sz >= maximum)
@@ -1862,26 +1958,15 @@ static int parse_inifile(const char* filename)
 {
     int total = load_file( filename, &inibuf, (1 << 12) );
     if (total > 0)
-        total = parse_tuples( 0L, inivalues, inibuf, '=', "\r\n", MAX_TUPLES );
-    return (inivalues_total = total);
-}
-
-static char* tuple_search(struct data_tuple* tuples[], int total, const char* arg)
-{
-    struct data_tuple key={ (char*) arg, NULL };
-    struct data_tuple** found = bsearch(
-		&key, tuples, total,
-		sizeof(struct data_tuple*),
-		tuple_cmp
-	);
-	return (char*) (found ? (*found)->value : NULL);
+        total = parse_tuples( 0L, inifile, inibuf, '=', "\r\n", MAX_TUPLES );
+    return (inifile_total = total);
 }
 
 static int get_cached_url(struct connection* conn, const char* arg)
 {
     struct data_bucket key={ (char*) arg, NULL };
     struct data_bucket** found = bsearch(
-		&key, buckets, buckets_total,
+		&key, memcache, memcache_total,
 		sizeof(struct data_bucket*),
 		bucket_cmp
 	);
@@ -1896,32 +1981,10 @@ static int get_cached_url(struct connection* conn, const char* arg)
 	return found ? 1 : 0;
 }
 
-static char* inisearch(const char* key, const char* deflt)
-{
-	char *value = tuple_search( inivalues, inivalues_total, key );
-	return value ? value : (char*) deflt;
-}
-
-static char* htpasswd(const char* user, const char* password)
-{
-	char *crypted = tuple_search( passwords, passwords_total, user );
-    return crypted;
-}
-
-static char* pwdsearch(const char* arg)
-{
-	return tuple_search( passwords, passwords_total, arg );
-}
-
-static char* hdrsearch(struct connection* conn, const char* arg)
-{
-	return tuple_search( conn->headers, conn->headers_total, arg );
-}
-
-static const char* url_content_type(const char* url)
+static const char* url_content_type(const char* url, int urllen)
 {
 	int period = 0;
-	int urllen = (int)strlen(url);
+	//int urllen = urllen; //(int)strlen(url);
     char *mimetype = NULL;
 
 	for (period = urllen - 1;
@@ -2031,6 +2094,7 @@ static int parse_request(struct connection* conn)
 		;
 
 	conn->url = split_string(conn->request, bound1, bound2);
+	conn->urllen = bound2 - bound1;
 
 	/* parse protocol to determine conn_close */
 	if (conn->request[bound2] == ' ') {
@@ -2125,18 +2189,21 @@ static ssize_t get_locate_listing(const char* path, struct dlent** *output, size
     proc = popen( cmd, "r" );
 
     if ( proc ) {
-        char *curname = xmalloc( 4096 );
-        size_t chrs = 0;
+        char *curname = xmalloc( MAX_BUFSZ+1 );
+        size_t chrs = MAX_BUFSZ;
+		ssize_t nread = 0;
 		struct stat s;
 
         while ( !feof(proc) && !ferror(proc) ) {
 
-            if (getline( &curname, &chrs, proc ) > 0) {
+            nread = getline( &curname, &chrs, proc );
+
+            if (nread > 0) {
 
 		        if (stat(curname, &s) == -1)
 		        { continue; } /* skip un-stat-able files */
 
-                if (*maxlen < chrs) { *maxlen = chrs; }
+                if (*maxlen < nread) { *maxlen = nread; }
 
                 if (entries == pool) {
                     pool *= 2;
@@ -2147,6 +2214,7 @@ static ssize_t get_locate_listing(const char* path, struct dlent** *output, size
                 list[entries]->name = xstrdup( curname );
                 list[entries]->is_dir = S_ISDIR(s.st_mode);
                 list[entries]->size = s.st_size;
+
                 entries++;
             }
         }
@@ -2190,7 +2258,7 @@ static ssize_t make_sorted_dirlist(const char* path, struct dlent** *output, siz
 		{ continue; } /* skip "." */
 
 		slen = strlen(ent->d_name);
-		assert(sen <= MAXNAMLEN);
+		assert(slen <= MAXNAMLEN);
 		sprintf(currname, "%s%s", path, ent->d_name);
 
 		if (stat(currname, &s) == -1)
@@ -2207,6 +2275,7 @@ static ssize_t make_sorted_dirlist(const char* path, struct dlent** *output, siz
 		list[entries]->name = xstrdup(ent->d_name);
 		list[entries]->is_dir = S_ISDIR(s.st_mode);
 		list[entries]->size = s.st_size;
+
 		entries++;
 	}
 
@@ -2469,9 +2538,10 @@ static void process_get(struct connection* conn)
 	}
 
 	/* does it end in a slash? serve up url/index_name */
-	slash_path = decoded_url[strlen(decoded_url) - 1] == '/';
+	slash_path = decoded_url[ conn->decoded_urllen - 1 ] == '/';
+	//slash_path = decoded_url [strlen(decoded_url) - 1] == '/';
 
-	if (slash_path) {
+	if ( slash_path ) {
 
 		xasprintf(&target, "%s%s%s", wwwroot, decoded_url, index_name);
 
@@ -2494,12 +2564,13 @@ static void process_get(struct connection* conn)
 
 			return;
 		}
-		mimetype = url_content_type(index_name);
+		mimetype = url_content_type( index_name, index_name_len );
 	}
 	else {
 		/* points to a file */
 		xasprintf(&target, "%s%s", wwwroot, decoded_url);
-		mimetype = url_content_type(decoded_url);
+		//mimetype = url_content_type( decoded_url, strlen(decoded_url));
+		mimetype = url_content_type( decoded_url, conn->decoded_urllen );
 	}
 
 	/* check if url was cached */
@@ -2646,8 +2717,8 @@ static void process_get(struct connection* conn)
 		conn->http_code = 206;
 
 		if (debug) {
-			printf("sending %llu-%llu/%llu\n",
-			       llu(from), llu(to), llu(conn->payload_size));
+			fprintf( logfile, "sending %llu-%llu/%llu\n",
+			    llu(from), llu(to), llu(conn->payload_size));
 		}
 	}
 	else {
@@ -2688,7 +2759,8 @@ static void process_post(struct connection* conn)
                     conn->url = xstrdup( postfile_name );
 
                 } else if (strcmp( conn->url, "/" )) {
-                    char *sptr = conn->url + strlen(conn->url);
+                    //char *sptr = conn->url + strlen(conn->url);
+                    char *sptr = conn->url + conn->urllen;
                     for (; *sptr-- != '/'; );
                     (*++sptr) = '\0';
                 }
@@ -2750,9 +2822,6 @@ static void process_request(struct connection* conn)
 
 	/* advance state */
 	conn->state = SEND_HEADER;
-	/* request not needed anymore */
-	free(conn->request);
-	conn->request = NULL; /* important: don't free it again later */
 }
 
 /* Receiving request. */
@@ -2794,7 +2863,9 @@ static void poll_recv_request(struct connection* conn)
 	assert(recvd > 0);
 
 	conn->request = xrealloc(
-        conn->request, conn->request_length + (size_t)recvd + 1);
+        conn->request, conn->request_length + (size_t)recvd + 1
+	);
+
 	memcpy(conn->request + conn->request_length, buf, (size_t)recvd);
 	conn->request_length += (size_t)recvd;
 	conn->request[conn->request_length] = 0;
@@ -3071,6 +3142,7 @@ static void httpd_poll(void)
 
 	timeout.tv_sec = idletime;
 	timeout.tv_usec = 0;
+
 	FD_ZERO(&recv_set);
 	FD_ZERO(&send_set);
 	max_fd = 0;
@@ -3084,10 +3156,6 @@ static void httpd_poll(void)
 		poll_check_timeout(conn);
 
 		switch (conn->state) {
-		case DONE:
-			/* do nothing */
-			break;
-
 		case RECV_REQUEST:
 			MAX_FD_SET(conn->socket, &recv_set);
 			bother_with_timeout = 1;
@@ -3097,6 +3165,11 @@ static void httpd_poll(void)
 		case SEND_REPLY:
 			MAX_FD_SET(conn->socket, &send_set);
 			bother_with_timeout = 1;
+			break;
+
+		case DONE:
+		default:
+			/* do nothing */
 			break;
 		}
 	}
@@ -3108,7 +3181,7 @@ static void httpd_poll(void)
 
 	if (select_ret == 0) {
 		if (!bother_with_timeout)
-		{ errx(1, "select() timed out"); }
+		{ err(1, "select() timed out"); }
 		else
 		{ return; }
 	}
@@ -3150,6 +3223,7 @@ static void httpd_poll(void)
 
 		case DONE:
 			/* (handled later; ignore for now as it's a valid state) */
+
 			break;
 		}
 
@@ -3161,6 +3235,7 @@ static void httpd_poll(void)
 				free_connection(conn);
 				free_conn_tuples(conn);
 				free(conn);
+				num_connections -= 1;
 			}
 			else {
 				recycle_connection(conn);
@@ -3174,7 +3249,6 @@ static void httpd_poll(void)
 }
 
 /* Daemonize helpers. */
-#define PATH_DEVNULL "/dev/null"
 static int lifeline[2] = { -1, -1 };
 static int fd_null = -1;
 
@@ -3185,10 +3259,10 @@ static void daemonize_start(void)
 	if (pipe(lifeline) == -1)
 	{ err(1, "pipe(lifeline)"); }
 
-	fd_null = open(PATH_DEVNULL, O_RDWR, 0);
+	fd_null = open( "/dev/null", O_RDWR, 0);
 
 	if (fd_null == -1)
-	{ err(1, "open(" PATH_DEVNULL ")"); }
+	{ err(1, "open(\"/dev/null\")"); }
 
 	f = fork();
 
@@ -3254,7 +3328,6 @@ static void daemonize_finish(void)
  * Original was copyright (c) 2005 Pawel Jakub Dawidek <pjd@FreeBSD.org>
  */
 static int pidfile_fd = -1;
-#define PIDFILE_MODE 0600
 
 static void pidfile_remove(void)
 {
@@ -3299,7 +3372,7 @@ static void pidfile_create(void)
 
 	/* Open the PID file and obtain exclusive lock. */
 	fd = open(pidfile_name,
-	     O_WRONLY | O_CREAT | O_EXLOCK | O_TRUNC | O_NONBLOCK, PIDFILE_MODE);
+	     O_WRONLY | O_CREAT | O_EXLOCK | O_TRUNC | O_NONBLOCK, 0600);
 
 	if (fd == -1) {
 		if ((errno == EWOULDBLOCK) || (errno == EEXIST))
@@ -3382,8 +3455,6 @@ static void parse_commandline(const int argc, char* argv[])
 			errx(1, "Invalid locate search maximum");
         }
     }
-
-	printf( "Using WWWROOT '%s'\n", wwwroot );
 
 	value = inisearch( "General/use-ipv4", "yes" );
 
@@ -3561,6 +3632,8 @@ static void parse_commandline(const int argc, char* argv[])
 		{ errx(1, "unknown argument `%s'", argv[i]); }
 	}
 
+	index_name_len = strlen( index_name );
+
 	if ( mimefile_name ) {
 		if (!parse_mimefile( mimefile_name )) {
 			errx(1, "Invalid mimetype file");
@@ -3568,7 +3641,7 @@ static void parse_commandline(const int argc, char* argv[])
 	}
 }
 
-void init_buckets()
+void init_memcache()
 {
 	struct stat filestat;
 	char path[256]={'\0'};
@@ -3578,7 +3651,7 @@ void init_buckets()
     int nread = 0;
 	int i = 0;
 
-	for (i=1; i < MAX_BUCKETS; i++) {
+	for (i=1; i < MAX_CACHE; i++) {
 
 		sprintf( key, "Memcache/%d", i ); 
 
@@ -3592,45 +3665,51 @@ void init_buckets()
 			break;
 		}
 
-    	nread = load_file( path, &buf, (1 << 15) );
+    	nread = load_file( path, &buf, (1 << 17) );
 
 		if (nread < 1) {
             err(1, "failed to read cache file (\"%s\")", path);
 			break;
 		}
 
-		buckets[i-1] = xmalloc(sizeof(struct data_bucket));
-		buckets[i-1]->key = fname;
-		buckets[i-1]->value = buf;
-		buckets[i-1]->size = nread;
-		buckets[i-1]->lastmod = filestat.st_mtime;
+		memcache[i-1] = xmalloc(sizeof(struct data_bucket));
+		memcache[i-1]->key = fname;
+		memcache[i-1]->value = buf;
+		memcache[i-1]->size = nread;
+		memcache[i-1]->lastmod = filestat.st_mtime;
 
 		buf = NULL;
 	}
 
-	buckets_total = i-1;
+	memcache_total = i-1;
 
-	if (buckets_total > 1)
+	if (memcache_total > 1)
 		bucket_sort();
 
-	//fprintf(stderr, "buckets_total %d\n", buckets_total );
+	//fprintf(stderr, "memcache_total %d\n", memcache_total );
 }
 
 /* Execution starts here. */
 int main(int argc, char** argv)
 {
-	printf("%s, %s.\n", pkgname, copyright);
+	now = time(NULL);
+
+	logfile = stdout;
 
 	parse_commandline( argc, argv );
 
-	if (logfile_name == NULL)
+	if (logfile_name == NULL) {
 	    logfile = stdout;
-	else {
-		logfile = fopen(logfile_name, "ab");
+	} else {
+		logfile = fopen( logfile_name, "ab" );
 		if (logfile == NULL) {
             errx(1, "failed to open log file (\"%s\")", logfile_name);
 		}
 	}
+
+	fprintf( logfile, "\n%s, %s.\n", pkgname, copyright );
+	fprintf( logfile, "Using WWWROOT '%s'\n", wwwroot );
+	fprintf( logfile, "Started on %s\n", ctime(&now) );
 
 	parse_default_extension_map();
 
@@ -3645,7 +3724,7 @@ int main(int argc, char** argv)
 	init_sockin();
 
 	if ( want_cache ) {
-		init_buckets();
+		init_memcache();
 	}
 
 	if ( want_daemon ) {
@@ -3662,17 +3741,18 @@ int main(int argc, char** argv)
 	if (signal(SIGTERM, stop_running) == SIG_ERR)
 	{ err(1, "signal(SIGTERM)"); }
 
+	if (chdir(wwwroot) == -1)
+	{ err(1, "chdir(%s)", wwwroot); }
+
 	/* security */
 	if (want_chroot) {
-		tzset(); /* read /etc/localtime before we chroot */
 
-		if (chdir(wwwroot) == -1)
-		{ err(1, "chdir(%s)", wwwroot); }
+		tzset(); /* read /etc/localtime before we chroot */
 
 		if (chroot(wwwroot) == -1)
 		{ err(1, "chroot(%s)", wwwroot); }
 
-		printf("chrooted to `%s'\n", wwwroot);
+		fprintf( logfile, "chrooted to `%s'\n", wwwroot);
 		wwwroot[0] = '\0'; /* empty string */
 	}
 
@@ -3686,14 +3766,14 @@ int main(int argc, char** argv)
 		if (setgid(drop_gid) == -1)
 		{ err(1, "setgid(%d)", (int)drop_gid); }
 
-		printf("set gid to %d\n", (int)drop_gid);
+		fprintf( logfile, "set gid to %d\n", (int)drop_gid);
 	}
 
 	if (drop_uid != INVALID_UID) {
 		if (setuid(drop_uid) == -1)
 		{ err(1, "setuid(%d)", (int)drop_uid); }
 
-		printf("set uid to %d\n", (int)drop_uid);
+		fprintf( logfile, "set uid to %d\n", (int)drop_uid);
 	}
 
 	/* create pidfile */
@@ -3712,30 +3792,13 @@ int main(int argc, char** argv)
         fclose(guestbook_file);
     }
 
-	/* close and free connections */
-	{
-		struct connection* conn, *next;
-		LIST_FOREACH_SAFE(conn, &connlist, entries, next) {
-			LIST_REMOVE(conn, entries);
-			free_connection(conn);
-			free_conn_tuples(conn);
-			free(conn);
-		}
-	}
+	now = time(NULL);
 
-	/* free the mallocs */
-	{
-        free_tuples( redirects );
-        free_tuples( mimetypes );
-
-		free(keep_alive_field);
-		free(wwwroot);
-		free(server_hdr);
-	}
 	/* usage stats */
 	{
 		struct rusage r;
 		getrusage(RUSAGE_SELF, &r);
+		fprintf( logfile, "\nShutdown on %s", ctime(&now));
 		fprintf( logfile, "CPU time used: %u.%02u user, %u.%02u system\n",
 		       (unsigned int)r.ru_utime.tv_sec,
 		       (unsigned int)(r.ru_utime.tv_usec / 10000),
@@ -3747,6 +3810,17 @@ int main(int argc, char** argv)
 		fflush( logfile );
 	}
 
+	/* close and free connections */
+	{
+		struct connection* conn, *next;
+		LIST_FOREACH_SAFE(conn, &connlist, entries, next) {
+			LIST_REMOVE(conn, entries);
+			free_connection(conn);
+			free_conn_tuples(conn);
+			free(conn);
+		}
+	}
+
 	if (pidfile_name != NULL) {
         pidfile_remove();
     }
@@ -3755,6 +3829,20 @@ int main(int argc, char** argv)
         fflush(logfile);
         fclose(logfile);
     }
+
+	/* free the mallocs */
+	{
+        free_tuples( redirects );
+        free_tuples( mimetypes );
+        free_tuples( inifile );
+
+        free(mimebuf);
+        free(inibuf);
+
+		free(keep_alive_field);
+		free(wwwroot);
+		free(server_hdr);
+	}
 	return 0;
 }
 
