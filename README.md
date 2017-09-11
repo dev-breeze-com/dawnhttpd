@@ -62,8 +62,7 @@ BUGS
 ====
 
    Strange bug in the tuple_cmp function.  
-   Debug to see if it occurs on your computer, where the  
-   const parameter o2 gets reset to NULL.  
+   Debug to see if it occurs on your computer, where the  const parameter o2 gets reset to NULL.  
    Bug reports, patches and suggestions are much appreciated.  
    See GitHub account https://www.github.com/dev-breeze-com/dawnhttpd
 
