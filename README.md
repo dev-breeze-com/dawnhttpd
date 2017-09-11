@@ -53,6 +53,7 @@ CONFIGURATION
 =============
 
    INI-style configuration was added for settings, passwords, and mimetypes.  
+   Passwords must be in the format of the password entry in /etc/shadow (crypt).  
    Invoke the command *dawnhttpd --help* for help information.  
    See README.cmd.txt for additional command information.  
    Guestbook entry keys should be encased by '<%' and '%>'.
