@@ -18,7 +18,8 @@ INTRODUCTION
    type based handlers. It can drop privileges before accepting connections;
    and, it can log received requests. It can log POST request data in a
    guestbook. It can, easily, be used in conjunction with Lighttpd as proxy.
-   It compiles and runs on 32 and 64 bits computers.
+   It supports basic throttling and basic http authentication. It compiles
+   and runs on 32 and 64 bits computers.
 
 
 FEATURES
@@ -29,22 +30,31 @@ FEATURES
    - Support for guestboooks.
    - Support for basic memory cache.
    - Support for slocate requests.
+   - Support for basic throttling (size in KB).
+   - Support for basic authentication.
 
 
 BUILDING
 ========
 
+   Enable ipv6 by including -DENABLE_IPV6 in the Makefile CFLAGS.  
    Enable slocate by including -DENABLE_SLOCATE in the Makefile CFLAGS.  
+   Enable guestbook by including -DENABLE_GUESTBOOK in the Makefile CFLAGS.  
+   Enable pidfile by including -DENABLE_PIDFILE in the Makefile CFLAGS.  
+   Enable password by including -DENABLE_PASSWORD in the Makefile CFLAGS.  
+
    Install dawnhttpd by running the following commands, as root:  
 	   make && make install  
-	   copy settings.ini to /etc/dawnhttpd/
+
+   Copy settings.ini to /etc/dawnhttpd/
 
 
 CONFIGURATION
 =============
 
-   INI-style configuration was added, in the updated version.
-   See README.cmd.txt for commands.
+   INI-style configuration was added for settings, passwords, and mimetypes.  
+   Invoke the command *dawnhttpd --help* for help information.  
+   See README.cmd.txt for additional command information.  
    Guestbook entry keys should be encased by '<%' and '%>'.
 
 

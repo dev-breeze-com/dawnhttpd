@@ -21,14 +21,8 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
-static const char pkgname[] = "dawnhttpd/1.3.0";
-static const char copyright[] = "copyright (c) 2016 Tsert.Com";
-
-/* Possible build options: -DDEBUG -DNO_IPV6 */
-
-#ifndef NO_IPV6
-#define HAVE_INET6
-#endif
+static const char pkgname[] = "dawnhttpd/1.4.0";
+static const char copyright[] = "copyright (c) 2017 Tsert.Inc";
 
 #ifndef DEBUG
 #define NDEBUG
@@ -47,12 +41,14 @@ static const int debug = 1;
 # include <sys/sendfile.h>
 #endif
 
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/param.h>
+
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -74,6 +70,8 @@ static const int debug = 1;
 #include <time.h>
 #include <unistd.h>
 
+#include "cdecode.h"
+
 #ifdef __sun__
 # ifndef INADDR_NONE
 #  define INADDR_NONE -1
@@ -91,12 +89,10 @@ static const int debug = 1;
 /* To prevent a malformed request from eating up too much memory, die once the
  * request exceeds this many bytes:
  */
-#define MAX_REQUEST_LENGTH 4000
-#define MAX_USERS   100
-#define MAX_REDIRS  20
-#define MAX_HEADERS 20
-#define MAX_TUPLES  100
-#define MAX_MIMES   500
+#define MAX_REQUEST_LENGTH	4000
+#define MAX_POST_LENGTH 	16384
+#define MAX_HEADERS	50
+#define MAX_TUPLES	250
 #define MAX_CACHE	17
 
 #ifndef MAX_BUFSZ
@@ -235,6 +231,7 @@ struct dlent {
 struct data_tuple {
 	char* key;
 	char* value;
+	//int code;
 };
 
 struct data_bucket {
@@ -250,12 +247,13 @@ struct connection {
 	LIST_ENTRY(connection) entries;
 
 	int socket;
-#ifdef HAVE_INET6
+#ifdef ENABLE_INET6
 	struct in6_addr client;
 #else
 	in_addr_t client;
 #endif
 	time_t last_active;
+	struct timeval last_chrono;
 	enum {
 	    RECV_REQUEST=0,   /* receiving request */
 	    SEND_HEADER,    /* sending generated header */
@@ -273,9 +271,10 @@ struct connection {
 	size_t urllen,decoded_urllen;
 
 	/* request fields */
-	char* method, *url, *decoded_url;
-	char* referer, *user_agent;
-	char* host, *auth, *cookies;
+	char *method, *suffix;
+	char *url, *decoded_url;
+	char *referer, *user_agent;
+	char *host, *auth, *cookies;
 
 	off_t payload_size;
 	time_t payload_lastmod;
@@ -283,9 +282,12 @@ struct connection {
 	off_t range_begin, range_end;
 	off_t range_begin_given, range_end_given;
 
+	char* auth_header;
+
 	char* header;
 	size_t header_length, header_sent;
-	int header_dont_free, header_only, http_code, conn_close;
+	int header_only, conn_close;
+	int http_code, http_error;
 	size_t headers_total;
 
 	char* body;
@@ -295,24 +297,33 @@ struct connection {
 
 	enum { REPLY_GENERATED=0, REPLY_CACHED, REPLY_FROMFILE } reply_type;
 	char* reply;
-	int reply_dont_free;
-	int reply_fd;
-	off_t reply_start, reply_length, reply_sent,
-	      total_sent; /* header + body = total, for logging */
+	int reply_fd, reply_blksz, reply_burst;
+	float reply_msecs;
+	off_t reply_start, reply_length, reply_sent;
+	off_t total_sent; /* header + body = total, for logging */
 };
 
+#ifdef ENABLE_SLOCATE
 static const char* locate_dbpath = NULL;
 static const char* locate_maxhits = NULL;
+#endif
 
 static const char* redirect_all_url = NULL;
-static struct data_tuple* redirects[MAX_REDIRS];
-static int redirects_total = 0;
+static int use_redirect = 0;
 
-static struct data_tuple* passwords[MAX_USERS];
+#ifdef ENABLE_PASSWORD
+static char *passwdbuf = NULL;
+static const char *password_salt = NULL;
+static const char* password_file = NULL;
+static struct data_tuple* passwords[MAX_TUPLES];
+static int password_saltlen = 0;
 static int passwords_total = 0;
+static int use_password = 0;
+#endif
 
 static char *mimebuf = NULL;
-static struct data_tuple* mimetypes[MAX_MIMES];
+static const char* mimefile_name = NULL;
+static struct data_tuple* mimetypes[MAX_TUPLES];
 static int mimetypes_total = 0;
 
 static char *inibuf = NULL;
@@ -334,6 +345,11 @@ static char* keep_alive_field = NULL;
 /* Time is cached in the event loop to avoid making an excessive number of
  * gettimeofday() calls.
  */
+static int CHRONO_SZ = sizeof(struct timeval);
+static struct timeval chrono;
+static int use_millisecs = 0;
+static int use_throttling = 0;
+static int burst_size = 0;
 static time_t now;
 
 /* Defaults can be overridden on the command-line */
@@ -344,30 +360,32 @@ static int max_connections = -1; /* kern.ipc.somaxconn */
 static size_t index_name_len = 10;
 static const char* index_name = "index.html";
 static const char* postfile_name = NULL;
-static const char* mimefile_name = NULL;
 
+#ifdef ENABLE_GUESTBOOK
 static char* guestbook_template = NULL;
 static FILE* guestbook_file = NULL;
-
-static int no_listing = 0;
-
-static int sockin = -1;   /* socket to accept connections from */
-#ifdef HAVE_INET6
-static int use_inet6 = 0; /* whether the socket uses inet6 */
 #endif
 
-static char* wwwroot = NULL;      /* a path name */
+static int sockin = -1;   /* socket to accept connections from */
+static int use_inet6 = 0; /* whether the socket uses inet6 */
+
+static char* wwwroot = NULL;
+static char* wwwrealm = NULL;
 static char* server_hdr = NULL;
+
 static char* pidfile_name = NULL; /* NULL = no pidfile */
 static char* logfile_name = "/var/log/dawnhttpd.log";
 static FILE* logfile = NULL;
 
-static int want_chroot = 0;
 static int want_cache = 0;
-static int want_daemon = 0;
+static int want_chroot = 0;
+static int want_redirect = 0;
+
 static int want_accf = 0;
+static int want_daemon = 0;
 static int want_keepalive = 1;
 static int want_server_id = 1;
+static int want_listing = 1;
 static int wwwrootlen = 0;
 
 static uint64_t total_in = 0;
@@ -386,16 +404,18 @@ static gid_t drop_gid = INVALID_GID;
 /* Default mimetype mappings - make sure this array is NULL terminated. */
 static struct data_tuple default_extension_map[] = {
 	{ "application/emg", "emg" },
-	{ "application/ogg", "ogg" },
 	{ "application/pdf", "pdf" },
 	{ "application/xml", "xsl" },
 	{ "application/xml", "xml" },
 	{ "application/xml-dtd", "dtd" },
 	{ "application/xslt+xml", "xslt" },
 	{ "application/zip", "zip" },
+	{ "audio/flac", "flac" },
 	{ "audio/mpeg", "mp2" },
 	{ "audio/mpeg", "mp3" },
 	{ "audio/mpeg", "mpga" },
+	{ "audio/ogg", "ogg" },
+	{ "audio/opus", "opus" },
 	{ "image/gif", "gif" },
 	{ "image/jpeg", "jpeg" },
 	{ "image/jpeg", "jpe" },
@@ -410,14 +430,22 @@ static struct data_tuple default_extension_map[] = {
 	{ "video/mpeg", "mpeg" },
 	{ "video/mpeg", "mpe" },
 	{ "video/mpeg", "mpg" },
+	{ "video/ogg", "daala" },
+	{ "video/ogg", "ogv" },
+	{ "video/divx", "divx" },
 	{ "video/quicktime", "qt" },
 	{ "video/quicktime", "mov" },
+	{ "video/x-matroska", "mkv" },
 	{ "video/x-msvideo", "avi" },
 	{ NULL, NULL }
 };
 
+static const char config_file[] = "/etc/dawnhttpd/settings.ini";
 static const char octet_stream[] = "application/octet-stream";
 static const char* default_mimetype = octet_stream;
+
+static char base64_buffer[MAXNAMLEN]; 
+static char* base64_buf = base64_buffer;
 
 /* Prototypes. */
 static void poll_recv_request(struct connection* conn);
@@ -428,7 +456,8 @@ static void poll_send_reply(struct connection* conn);
 static void xclose(const int fd)
 {
 	if (close(fd) == -1)
-	{ err(1, "close()"); }
+	//{ err(1, "close()"); }
+	{ warn( "close()"); }
 }
 
 /* malloc that dies if it can't allocate. */
@@ -619,8 +648,7 @@ static int maxstrlen(const char* str, int max)
 }
 
 /* Split string out of src with range [left:right-1] */
-static char* split_string(const char* src,
-                          const size_t left, const size_t right)
+static char* split_string(const char* src, const size_t left, const size_t right)
 {
 	char* dest;
 
@@ -700,13 +728,16 @@ static int make_safe_url(struct connection* conn)
 	{ ends_in_slash = 1; }
 
 	/* count the slashes */
-	for (i = 0, num_slashes = 0; i < urllen; i++)
-		if (url[i] == '/')
-		{ num_slashes++; }
+	for (i = 0, num_slashes = 0; i < urllen; i++) {
+		if (url[i] == '/') {
+			num_slashes++;
+		}
+	}
 
 	/* make an array for the URL elements */
 	assert(num_slashes > 0);
 	chunks = xmalloc(sizeof(*chunks) * num_slashes);
+
 	/* split by slashes and build chunks array */
 	num_chunks = 0;
 
@@ -756,32 +787,20 @@ static int make_safe_url(struct connection* conn)
 	free(chunks);
 
 	if ((num_chunks == 0) || ends_in_slash)
-	{ url[pos++] = '/'; }
+		url[pos++] = '/';
 
 	assert(pos <= urllen);
 
 	url[pos] = '\0';
 
-	//conn->decoded_url = url;
 	conn->decoded_urllen = pos;
 
 	return (1);
 }
 
-static int add_redirect(const char* const host, const char* const url)
-{
-	int i = redirects_total++;
-	if (i < MAX_REDIRS) {
-		redirects[i] = xmalloc(sizeof(struct data_tuple));
-		redirects[i]->key = xstrdup(host);
-		redirects[i]->value = xstrdup(url);
-	}
-	return i < MAX_REDIRS ? 1 : 0;
-}
-
 static const char* get_address_text(const void* addr)
 {
-#ifdef HAVE_INET6
+#ifdef ENABLE_INET6
 	if (use_inet6) {
 		static char text_addr[INET6_ADDRSTRLEN];
 		inet_ntop(AF_INET6, (const struct in6_addr*)addr, text_addr,
@@ -792,6 +811,16 @@ static const char* get_address_text(const void* addr)
 #endif
 	{
 		return inet_ntoa(*(const struct in_addr*)addr);
+	}
+}
+
+static void update_clock(struct connection *conn)
+{
+	conn->last_active = now;
+
+	if ( use_millisecs ) {
+		memcpy( &conn->last_chrono, &chrono, CHRONO_SZ );
+		conn->last_chrono.tv_usec += conn->reply_msecs * 100 * 1000;
 	}
 }
 
@@ -860,20 +889,17 @@ static char* tuple_search(struct data_tuple* tuples[], int total, const char* ar
 	return (char*) (found ? (*found)->value : NULL);
 }
 
-static char* htpasswd(const char* user, const char* password)
-{
-	char *crypted = tuple_search( passwords, passwords_total, user );
-    return crypted;
-}
-
-static char* pwdsearch(const char* arg)
-{
-	return tuple_search( passwords, passwords_total, arg );
-}
-
 static char* hdrsearch(struct connection* conn, const char* arg)
 {
 	return tuple_search( conn->headers, conn->headers_total, arg );
+}
+
+static int ini_evaluate(const char* key, const char* eqvalue, const char* deflt)
+{
+	char *value = tuple_search( inifile, inifile_total, key );
+	if (!value)
+		return deflt ? !strcasecmp(deflt,eqvalue) : 0;
+	return value ? !strcasecmp(value,eqvalue) : 0;
 }
 
 static char* inisearch(const char* key, const char* deflt)
@@ -882,31 +908,29 @@ static char* inisearch(const char* key, const char* deflt)
 	return value ? value : (char*) deflt;
 }
 
+#ifdef ENABLE_PASSWORD
+static int htpasswd(const char* user, const char* password)
+{
+	char *value = tuple_search( passwords, passwords_total, user );
+	return value ? !strcasecmp(value,password) : 0;
+}
+#endif
+
 /* Initialize the sockin global.  This is the socket that we accept
  * connections from.
  */
-static void init_sockin(void)
+static int init_sockin(int lasttime)
 {
 	struct sockaddr_in addrin;
-#ifdef HAVE_INET6
+#ifdef ENABLE_INET6
 	struct sockaddr_in6 addrin6;
 #endif
 	socklen_t addrin_len;
 	char *value = NULL;
 	int sockopt = 0;
-	//int delay = 1;
 	int i = 0;
 
-	/*
-	if ( want_daemon ) {
-		value = inisearch( "General/bind-delay", "5" );
-		delay = (int)xstr_to_num( value );
-		delay = delay > 5 ? 5 : delay;
-		delay = delay < 0 ? 0 : delay;
-	}
-	*/
-
-#ifdef HAVE_INET6
+#ifdef ENABLE_INET6
 	if (use_inet6) {
 		memset(&addrin6, 0, sizeof(addrin6));
 
@@ -951,7 +975,13 @@ static void init_sockin(void)
 		sockin = socket(PF_INET, SOCK_STREAM, 0);
 	}
 
-	if (sockin == -1) { err(1, "socket()"); }
+	if (sockin == -1) { 
+		if (lasttime) {
+			err(1, "socket()");
+		}
+		warn( "socket()");
+		return 0;
+	}
 
 	/* reuse address */
 	sockopt = 1;
@@ -980,7 +1010,7 @@ static void init_sockin(void)
 
 #endif
 	/* bind socket */
-#ifdef HAVE_INET6
+#ifdef ENABLE_INET6
 
 	if (use_inet6) {
 		addrin6.sin6_family = AF_INET6;
@@ -1036,12 +1066,13 @@ static void init_sockin(void)
 		printf("this platform doesn't support acceptfilter\n");
 #endif
 	}
+	return 1;
 }
 
 static void usage(const char* argv0)
 {
-	printf("usage:\t%s /path/to/wwwroot [flags]\n\n", argv0);
-	printf("flags:\t--port number (default: %u, or 80 if running as root)\n"
+	printf("Usage:\t%s [options]\n\n", argv0);
+	printf("\t--port number (default: %u, or 80 if running as root)\n"
 	       "\t\tSpecifies which port to listen on for connections.\n"
 	       "\t\tPass 0 to let the system choose any free port for you.\n\n", bindport);
 	printf("\t--addr ip (default: all)\n"
@@ -1050,11 +1081,14 @@ static void usage(const char* argv0)
 	printf("\t--maxconn number (default: system maximum)\n"
 	       "\t\tSpecifies how many concurrent connections to accept.\n\n");
 	printf("\t--stdout (default: /var/log/dawnhttpd.log)\n"
-	       "\t\tOutputs accesses to stdout.\n\n");
+	       "\t\tOutputs log info to stdout.\n\n");
 	printf("\t--chroot (default: don't chroot)\n"
 	       "\t\tLocks server into wwwroot directory for added security.\n\n");
-	printf("\t--daemon (default: don't daemonize)\n"
-	       "\t\tDetach from the controlling terminal and run in the background.\n\n");
+	printf("\t--no-daemon (default: daemonize)\n"
+	       "\t\tDo not detach from the controlling terminal to run in the background.\n\n");
+	printf("\t--no-keepalive\n"
+	       "\t\tDisables HTTP Keep-Alive functionality.\n\n");
+#if 0
 	printf("\t--index filename (default: %s)\n"
 	       "\t\tDefault file to serve when a directory is requested.\n\n",
 	       index_name);
@@ -1064,37 +1098,43 @@ static void usage(const char* argv0)
 	       "\t\tDo not serve listing if directory is requested.\n\n");
 	printf("\t--mimetypes filename (optional)\n"
 	       "\t\tParses specified file for extension-MIME associations.\n\n");
-	printf("\t--default-mimetype string (optional, default: %s)\n"
-	       "\t\tFiles with unknown extensions are served as this mimetype.\n\n",
-	       octet_stream);
-	printf("\t--uid uid/uname, --gid gid/gname (default: don't privdrop)\n"
-	       "\t\tDrops privileges to given uid:gid after initialization.\n\n");
-	printf("\t--pidfile filename (default: no pidfile)\n"
-	       "\t\tWrite PID to the specified file.  Note that if you are\n"
-	       "\t\tusing --chroot, then the pidfile must be relative to,\n"
-	       "\t\tand inside the wwwroot.\n\n");
-	printf("\t--no-keepalive\n"
-	       "\t\tDisables HTTP Keep-Alive functionality.\n\n");
-#ifdef __FreeBSD__
-	printf("\t--accf (default: don't use acceptfilter)\n"
-	       "\t\tUse acceptfilter.  Needs the accf_http module loaded.\n\n");
-#endif
 	printf("\t--forward host url (default: don't forward)\n"
 	       "\t\tWeb forward (301 redirect).\n"
 	       "\t\tRequests to the host are redirected to the corresponding url.\n"
 	       "\t\tThe option may be specified multiple times, in which case\n"
 	       "\t\tthe host is matched in order of appearance.\n\n");
+	printf("\t--default-mimetype string (optional, default: %s)\n"
+	       "\t\tFiles with unknown extensions are served as this mimetype.\n\n",
+	       octet_stream);
+#endif
+#ifdef ENABLE_PIDFILE
+	printf("\t--pidfile filename (default: no pidfile)\n"
+	       "\t\tWrite PID to the specified file.  Note that if you are\n"
+	       "\t\tusing --chroot, then the pidfile must be relative to,\n"
+	       "\t\tand inside the wwwroot.\n\n");
+#else
+	printf("\t(This binary was built without PID file support)\n\n");
+#endif
+	printf("\t--uid uid/uname, --gid gid/gname (default: don't privdrop)\n"
+	       "\t\tDrops privileges to given uid:gid after initialization.\n\n");
+#ifdef __FreeBSD__
+	printf("\t--accf (default: don't use acceptfilter)\n"
+	       "\t\tUse acceptfilter.  Needs the accf_http module loaded.\n\n");
+#endif
 	printf("\t--forward-all url (default: don't forward)\n"
 	       "\t\tWeb forward (301 redirect).\n"
 	       "\t\tAll requests are redirected to the corresponding url.\n\n");
 	printf("\t--no-server-id\n"
 	       "\t\tDon't identify the server type in headers\n"
 	       "\t\tor directory listings.\n\n");
-#ifdef HAVE_INET6
+#ifdef ENABLE_INET6
 	printf("\t--ipv6\n"
 	       "\t\tListen on IPv6 address.\n\n");
 #else
-	printf("\t(This binary was built without IPv6 support: -DNO_IPV6)\n\n");
+	printf("\t(This binary was built without IPv6 support)\n");
+#endif
+#ifndef ENABLE_PASSWORD
+	printf("\t(This binary was built without password support)\n");
 #endif
 }
 
@@ -1114,33 +1154,38 @@ static struct connection* new_connection(void)
 	conn->method = NULL;
 	conn->url = NULL;
 	conn->host = NULL;
-	conn->auth = NULL;
-	conn->cookies = NULL;
 	conn->decoded_url = NULL;
 	conn->referer = NULL;
 	conn->user_agent = NULL;
 
+	conn->content_len = 0;
 	conn->range_begin = 0;
 	conn->range_end = 0;
 	conn->range_begin_given = 0;
 	conn->range_end_given = 0;
 
+	conn->auth = NULL;
+	conn->cookies = NULL;
+	conn->auth_header = NULL;
+
 	conn->header = NULL;
 	conn->header_length = 0;
 	conn->header_sent = 0;
-	conn->header_dont_free = 0;
 	conn->header_only = 0;
 	conn->http_code = 0;
+	conn->http_error = 0;
 	conn->conn_close = 1;
 
 	conn->reply = NULL;
-	conn->reply_dont_free = 0;
 	conn->reply_fd = -1;
 	conn->reply_start = 0;
 	conn->reply_length = 0;
+	conn->reply_blksz = 0;
+	conn->reply_msecs = 0.1;
+	conn->reply_burst = 1 << 20;
 	conn->reply_sent = 0;
-	conn->reply_type = REPLY_GENERATED;
 	conn->total_sent = 0;
+	conn->reply_type = REPLY_GENERATED;
 
 	memset( conn->tuples, 0, sizeof(conn->tuples) );
 	memset( conn->headers, 0, sizeof(conn->headers) );
@@ -1159,7 +1204,7 @@ static struct connection* new_connection(void)
 static void accept_connection(void)
 {
 	struct sockaddr_in addrin;
-#ifdef HAVE_INET6
+#ifdef ENABLE_INET6
 	struct sockaddr_in6 addrin6;
 #endif
 
@@ -1168,7 +1213,7 @@ static void accept_connection(void)
 	/* allocate and initialise struct connection */
 	conn = new_connection();
 
-#ifdef HAVE_INET6
+#ifdef ENABLE_INET6
 	if (use_inet6) {
 		sin_size = sizeof(addrin6);
 		memset(&addrin6, 0, sin_size);
@@ -1188,7 +1233,7 @@ static void accept_connection(void)
 	nonblock_socket(conn->socket);
 	conn->state = RECV_REQUEST;
 
-#ifdef HAVE_INET6
+#ifdef ENABLE_INET6
 	if (use_inet6) {
 		conn->client = addrin6.sin6_addr;
 	}
@@ -1237,18 +1282,21 @@ static void logencode(const char* src, char* dest)
 	dest[j] = '\0';
 }
 
-static void log_connection(const struct connection* conn)
+static void log_connection(const struct connection* conn, int onrequest)
 {
-	char* safe_referer, *safe_user_agent, *safe_url;
-	//char* safe_method
+	char* safe_referer, *safe_user_agent;
+	char* safe_method, *safe_url;
 
 	if (logfile == NULL) { return; }
 
-	/* invalid - died in request */
-	if (conn->http_code == 0) { return; }
-
 	/* invalid - didn't parse - maybe too long */
 	if (conn->method == NULL) { return; }
+
+	/* invalid - died in request */
+	if (!onrequest && conn->http_code == 0) { return; }
+
+    //if (onrequest) {
+	//}
 
     //fprintf( logfile, "Len=%d\n", strlen(conn->x));
 
@@ -1260,28 +1308,28 @@ static void log_connection(const struct connection* conn)
         safe_##x = NULL; \
     }
 
-	//make_safe(method);
+	make_safe(method);
 	make_safe(url);
 	make_safe(referer);
 	make_safe(user_agent);
 
 #define use_safe(x) safe_##x ? safe_##x : ""
-	fprintf(logfile, "%lu %s \"%s %s\" %d %llu \"%s\" \"%s\"\n",
+	fprintf(logfile, "%lu %s \"%s %s\" [%d] %llu \"%s\" \"%s\"\n",
 	        (unsigned long int)now,
 	        get_address_text(&conn->client),
-	        conn->method,
-	        //use_safe(method),
+	        //conn->method,
+	        use_safe(method),
 	        use_safe(url),
 	        conn->http_code,
 	        //num_connections,
-	        llu(conn->total_sent),
+			onrequest ? llu(conn->content_len) : llu(conn->total_sent),
 	        use_safe(referer),
 	        use_safe(user_agent)
 	       );
 	fflush(logfile);
 
 #define free_safe(x) if (safe_##x) free(safe_##x);
-	//free_safe(method);
+	free_safe(method);
 	free_safe(url);
 	free_safe(referer);
 	free_safe(user_agent);
@@ -1311,7 +1359,8 @@ static void free_connection(struct connection* conn)
         printf("free_connection(%d)\n", conn->socket);
     }
 
-	log_connection( conn );
+	if ( conn->http_error )
+		log_connection( conn, 0 );
 
 	if (conn->socket != -1) { xclose(conn->socket); }
 
@@ -1323,9 +1372,9 @@ static void free_connection(struct connection* conn)
 
 	if (conn->decoded_url != NULL) { free( conn->decoded_url ); }
 
-	if (conn->header != NULL && !conn->header_dont_free) { free(conn->header); }
+	if (conn->header != NULL) { free(conn->header); }
 
-	if (conn->reply != NULL && !conn->reply_dont_free) { free(conn->reply); }
+	if (conn->reply != NULL && conn->reply_type != REPLY_CACHED) { free(conn->reply); }
 
 	if (conn->reply_fd != -1) { xclose(conn->reply_fd); }
 }
@@ -1355,30 +1404,36 @@ static void recycle_connection(struct connection* conn)
 	conn->referer = NULL;
 	conn->user_agent = NULL;
 	conn->host = NULL;
-	conn->auth = NULL;
-	conn->cookies = NULL;
 	conn->decoded_url = NULL;
 
+	conn->content_len = 0;
 	conn->range_begin = 0;
 	conn->range_end = 0;
 	conn->range_begin_given = 0;
 	conn->range_end_given = 0;
 
+	conn->auth = NULL;
+	conn->cookies = NULL;
+	conn->auth_header = NULL;
+
 	conn->header = NULL;
 	conn->header_length = 0;
 	conn->header_sent = 0;
-	conn->header_dont_free = 0;
 	conn->header_only = 0;
 	conn->http_code = 0;
+	conn->http_error = 0;
 
 	conn->conn_close = 1;
 	conn->reply = NULL;
-	conn->reply_dont_free = 0;
 	conn->reply_fd = -1;
 	conn->reply_start = 0;
 	conn->reply_length = 0;
+	conn->reply_blksz = 0;
+	conn->reply_msecs = 0.1;
+	conn->reply_burst = 1 << 20;
 	conn->reply_sent = 0;
 	conn->total_sent = 0;
+	//conn->reply_type = REPLY_GENERATED;
 	conn->state = RECV_REQUEST; /* ready for another */
 
 	if ( conn->tuples[0] ) { conn->tuples[0]->key = NULL; }
@@ -1447,12 +1502,10 @@ static void urldecode(struct connection* conn)
     ((hex) >= 'A' && (hex) <= 'F') ? ((hex)-'A'+10): \
     ((hex) >= 'a' && (hex) <= 'f') ? ((hex)-'a'+10): \
     ((hex)-'0') )
-			out[pos++] = HEX_TO_DIGIT(url[i + 1]) * 16 +
-			             HEX_TO_DIGIT(url[i + 2]);
+			out[pos++] = HEX_TO_DIGIT(url[i + 1]) * 16 + HEX_TO_DIGIT(url[i + 2]);
 			i += 2;
 #undef HEX_TO_DIGIT
-		}
-		else if (url[i] == '/' && url[i+1] == '/') {
+		} else if (url[i] == '/' && url[i+1] == '/') {
 			//skip;
 		} else {
 			/* straight copy */
@@ -1500,6 +1553,7 @@ static void default_reply(struct connection* conn, const int errcode, const char
 
 	/* Only really need to calculate the date once. */
 	rfc1123_date(date, now);
+
 	conn->reply_length = xasprintf(&(conn->reply),
        "<html><head><title>%d %s</title></head><body>\n"
        "<h1>%s</h1>\n" /* errname */
@@ -1510,20 +1564,40 @@ static void default_reply(struct connection* conn, const int errcode, const char
        errcode, errname, errname, reason, generated_on(date));
 	free(reason);
 
-	conn->header_length = xasprintf(&(conn->header),
-        "HTTP/1.1 %d %s\r\n"
-        "Date: %s\r\n"
-        "%s" /* server */
-        "Accept-Ranges: bytes\r\n"
-        "%s" /* keep-alive */
-        "Content-Length: %llu\r\n"
-        "Content-Type: text/html; charset=UTF-8\r\n"
-        "\r\n",
-        errcode, errname, date, server_hdr, keep_alive(conn),
-        llu(conn->reply_length));
+	if (conn->auth_header ) {
+		conn->header_length = xasprintf(&(conn->header),
+			"HTTP/1.1 %d %s\r\n"
+			"Date: %s\r\n"
+			"%s" /* server */
+			"Accept-Ranges: bytes\r\n"
+			"%s" /* keep-alive */
+			"%s\r\n" /* www-authenticate */
+			"Content-Length: %llu\r\n"
+			"Content-Type: text/html; charset=UTF-8\r\n"
+			"\r\n",
+			errcode, errname, date, server_hdr, keep_alive(conn),
+			conn->auth_header, llu(conn->reply_length));
+
+			free(conn->auth_header);
+			conn->auth_header = NULL;
+	}
+	else {
+		conn->header_length = xasprintf(&(conn->header),
+			"HTTP/1.1 %d %s\r\n"
+			"Date: %s\r\n"
+			"%s" /* server */
+			"Accept-Ranges: bytes\r\n"
+			"%s" /* keep-alive */
+			"Content-Length: %llu\r\n"
+			"Content-Type: text/html; charset=UTF-8\r\n"
+			"\r\n",
+			errcode, errname, date, server_hdr, keep_alive(conn),
+			llu(conn->reply_length));
+	}
 
 	conn->reply_type = REPLY_GENERATED;
 	conn->http_code = errcode;
+	conn->http_error = 1;
 }
 
 static void redirect(struct connection* conn, const char* format, ...) __printflike(2, 3);
@@ -1567,6 +1641,7 @@ static void redirect(struct connection* conn, const char* format, ...)
 	free(where);
 	conn->reply_type = REPLY_GENERATED;
 	conn->http_code = 301;
+	conn->http_error = 1;
 }
 
 static char* decode_url(struct connection* conn)
@@ -1575,13 +1650,11 @@ static char* decode_url(struct connection* conn)
 	urldecode( conn );
 
 	/* Make sure it's safe */
-	if (!make_safe_url( conn ))
-	{
-		default_reply(conn, 400, "Bad Request",
-		     "You requested an invalid URL: %s", conn->url);
-		return NULL;
-	}
-	return conn->decoded_url;
+	if (make_safe_url( conn ))
+		return conn->decoded_url;
+
+	default_reply(conn, 400, "Bad Request", "You requested an invalid URL: %s", conn->url);
+	return NULL;
 }
 
 static int dir_exists(const char* path)
@@ -1943,23 +2016,12 @@ static int load_file(const char* filename, char** buffer, int maximum)
     return total;
 }
 
-/*
- * Adds contents of specified file to mime_map list.
- */
-static int parse_mimefile(const char* filename)
+static int load_cfgfile(const char* path, char **buffer, struct data_tuple* tuples[], int maxsz)
 {
-    int total = load_file( filename, &mimebuf, (1 << 15) );
+    int total = load_file( path, buffer, 1 << 15 );
     if (total > 0)
-        total = parse_tuples( 0L, mimetypes, mimebuf, '=', "\r\n", MAX_MIMES );
-    return (mimetypes_total = total);
-}
-
-static int parse_inifile(const char* filename)
-{
-    int total = load_file( filename, &inibuf, (1 << 12) );
-    if (total > 0)
-        total = parse_tuples( 0L, inifile, inibuf, '=', "\r\n", MAX_TUPLES );
-    return (inifile_total = total);
+        total = parse_tuples( 0L, tuples, (*buffer), '=', "\r\n", maxsz );
+    return total;
 }
 
 static int get_cached_url(struct connection* conn, const char* arg)
@@ -1975,13 +2037,13 @@ static int get_cached_url(struct connection* conn, const char* arg)
 		conn->payload_size = (*found)->size;
 		conn->payload_lastmod = (*found)->lastmod;
 		conn->reply = (*found)->value;
+		conn->reply_type = REPLY_CACHED;
 		conn->reply_start = 0;
-		conn->reply_dont_free = 1;
 	}
 	return found ? 1 : 0;
 }
 
-static const char* url_content_type(const char* url, int urllen)
+static const char* url_content_type(const char* url, int urllen, char** suffix)
 {
 	int period = 0;
 	//int urllen = urllen; //(int)strlen(url);
@@ -1994,8 +2056,8 @@ static const char* url_content_type(const char* url, int urllen)
 		;
 
 	if ((period >= 0) && (url[period] == '.')) {
-        char *suffix = (char*) (url+period+1);
-		mimetype = tuple_search( mimetypes, mimetypes_total, suffix );
+        (*suffix) = (char*) (url+period+1);
+		mimetype = tuple_search( mimetypes, mimetypes_total, (*suffix) );
 	}
     return mimetype != NULL ? mimetype : default_mimetype;
 }
@@ -2304,19 +2366,17 @@ static void cleanup_sorted_dirlist(struct dlent** list, const ssize_t size)
 static int is_unreserved(const unsigned char c)
 {
 	if (c >= 'a' && c <= 'z') { return 1; }
-
 	if (c >= 'A' && c <= 'Z') { return 1; }
-
 	if (c >= '0' && c <= '9') { return 1; }
 
 	switch (c) {
-	case '-':
-	case '.':
-	case '_':
-	case '~':
-		return 1;
+		case '-':
+		case '.':
+		case '_':
+		case '~':
+			return 1;
+		break;
 	}
-
 	return 0;
 }
 
@@ -2445,6 +2505,7 @@ static void generate_dir_listing(struct connection* conn, const char* path)
 	conn->http_code = 200;
 }
 
+#ifdef ENABLE_GUESTBOOK
 static int fill_guestbook(struct connection* conn)
 {
     char *sptr = guestbook_template;
@@ -2476,56 +2537,111 @@ static int fill_guestbook(struct connection* conn)
 
     return 1;
 }
+#endif
+
+#ifdef ENABLE_PASSWORD
+static int password_ok(struct connection* conn, const char* user, const char* password)
+{
+	char *crypted = crypt( password, password_salt );
+	if ( crypted ) {
+		if (htpasswd( user, crypted )) {
+			//if ((conn->cookies = hdrsearch( conn, "Cookies" ))) {
+			//}
+			return 1;
+		}
+	}
+	return 0;
+}
 
 static int parse_auth(struct connection* conn)
 {
-	/* work out path of file being requested */
-	const char* decoded_url = decode_url( conn );
+	char* auth_url = xstrdup( conn->decoded_url );
+	int i = conn->decoded_urllen - 1;
+	const char* need_password = NULL;
+	char* protected_key = NULL;
+	char *password = NULL;
+	int nwrite = 0;
 
-	if ( !decoded_url ) { return (0); }
+	for (; i > 0 && auth_url[i] == '/'; --i)
+		auth_url[i] = '\0';
 
-	conn->host = hdrsearch( conn, "Host" );
+	xasprintf(&protected_key, "%s%s", "Protected/", auth_url );
+	need_password = inisearch( protected_key, NULL );
+	free(auth_url);
 
-#if 0
-	conn->auth = hdrsearch( conn, "Authorization" );
-	conn->cookies = hdrsearch( conn, "Cookies" );
+//fprintf( logfile, "Authenticate '%s' '%s' '%s'\n", protected_key, conn->url, conn->decoded_url );
+//fflush( logfile );
 
-    if (no_password) {
-        default_reply(conn, 401, "Unauthorized",
-              "The URL you requested (%s) requires a password.", conn->url
-        );
-        return 0;
-    }
-#endif
+	if ( need_password ) {
+
+		conn->auth = hdrsearch( conn, "Authorization" );
+
+		if (passwords_total < 1 || strcasestr( need_password, "forbidden" )) {
+			default_reply(conn, 403, "Forbidden",
+				"You sent a request that the server couldn't allow.");
+			return 0;
+		}
+
+		if ( conn->auth ) {
+
+			if ((password = strstr( conn->auth, "Basic " ))) {
+				base64_decodestate b64state={ step_a, '\0' };
+				int passwdlen = strlen(password+6);
+
+				base64_buf[passwdlen] = '\0';
+				nwrite = base64_decode_block( password+6, passwdlen, base64_buf, &b64state );
+
+//fprintf( logfile, "Authorize '%s' '%s' '%s' '%s' %d %d\n", conn->auth, (password+6), base64_buf, conn->decoded_url, nwrite, passwdlen );
+//fflush( logfile );
+
+				if (nwrite < passwdlen) {
+					if ((password = strchr( base64_buf, ':' ))) {
+						(*password) = '\0';
+
+						if (password_ok( conn, base64_buf, password+1 )) {
+							return 1;
+						}
+					}
+				}
+			}
+
+			default_reply(conn, 401, "Unauthorized",
+				"The URL you requested (%s) requires a password.",
+				conn->decoded_url
+			);
+			return 0;
+		}
+
+		xasprintf( &conn->auth_header, "WWW-Authenticate: Basic realm=%s", wwwrealm );
+
+		default_reply(conn, 401, "Unauthorized",
+			"The URL you requested (%s) requires a password.", conn->url
+		);
+		return 0;
+	}
 	return 1;
 }
+#endif
 
 /* Process a GET/HEAD request. */
 static void process_get(struct connection* conn)
 {
+	/* work out path of file being requested */
+	char* decoded_url = conn->decoded_url;
 	char date[DATE_LEN], lastmod[DATE_LEN];
-	char* target, *if_mod_since;
+	char *throttle, *target, *if_mod_since;
+	char *redirect_key, *msecs;
 	const char* mimetype = NULL;
+	const char* blksize = NULL;
 	const char* forward_to = NULL;
 	struct stat filestat;
 	int slash_path = 0;
+	int kbps, rc = 0;
 	size_t i=0;
-	int rc = 0;
 
-	/* work out path of file being requested */
-	char* decoded_url = decode_url(conn);
-
-	if ( !decoded_url ) { return; }
-
-	/* test the host against web forward options */
-	if (redirects_total > 0 && conn->host) {
-
-		for (i = 0; i < redirects_total; i++) {
-			if (!strcasecmp(redirects[i]->key, conn->host)) {
-				forward_to = redirects[i]->value;
-				break;
-			}
-		}
+	if (use_redirect && conn->host) {
+		xasprintf(&redirect_key, "%s%s", "Redirect/", conn->host);
+		forward_to = inisearch( redirect_key, NULL );
 	}
 
 	if (!forward_to) {
@@ -2545,10 +2661,13 @@ static void process_get(struct connection* conn)
 
 		xasprintf(&target, "%s%s%s", wwwroot, decoded_url, index_name);
 
-		if (!file_exists(target)) {
+		if (file_exists(target)) {
+			mimetype = url_content_type( index_name, index_name_len, &conn->suffix );
+
+		} else {
 			free(target);
 
-			if (no_listing) {
+			if (!want_listing) {
 				/* Return 404 instead of 403 to make --no-listing
 				 * indistinguishable from the directory not existing.
 				 * i.e.: Don't leak information.
@@ -2561,16 +2680,48 @@ static void process_get(struct connection* conn)
 			xasprintf(&target, "%s%s", wwwroot, decoded_url);
 			generate_dir_listing(conn, target);
 			free(target);
-
 			return;
 		}
-		mimetype = url_content_type( index_name, index_name_len );
-	}
-	else {
+	} else {
 		/* points to a file */
 		xasprintf(&target, "%s%s", wwwroot, decoded_url);
 		//mimetype = url_content_type( decoded_url, strlen(decoded_url));
-		mimetype = url_content_type( decoded_url, conn->decoded_urllen );
+		mimetype = url_content_type( decoded_url, conn->decoded_urllen, &conn->suffix );
+	}
+
+	if ( use_throttling ) {
+
+		xasprintf(&throttle, "%s%s", "Throttle/", mimetype);
+
+		if ((blksize = inisearch( throttle, NULL ))) {
+
+			assert( strlen(blksize) < 16 );
+
+			if (strstr(mimetype, "video/"))
+				conn->reply_burst = burst_size;
+
+			if (use_millisecs && (msecs = strchr( blksize, ',' ))) {
+				conn->reply_msecs = atoi( msecs+1 );
+				conn->reply_msecs /= 1000;
+				strncpy( throttle, blksize, msecs-blksize );
+				throttle[msecs-blksize] = '\0';
+				conn->reply_blksz = atoi( throttle ) * 1024;
+//		fprintf( logfile, "Throttling '%s' '%s' [%d, %02f, %d]\n", throttle, blksize, conn->reply_burst, conn->reply_msecs, conn->reply_blksz);
+
+			} else {
+				conn->reply_blksz = atoi( blksize ) * 1024;
+			}
+
+			kbps = conn->reply_blksz * 8;
+
+			if ( use_millisecs ) {
+				kbps /= conn->reply_msecs;
+			}
+
+			fprintf( logfile, "Throttling '%s' at %d Kbps [%d, %02f]\n", mimetype, kbps, conn->reply_burst, conn->reply_msecs);
+			fflush( logfile );
+		}
+		free(throttle);
 	}
 
 	/* check if url was cached */
@@ -2578,7 +2729,7 @@ static void process_get(struct connection* conn)
 
 	if ( rc ) {
 		conn->header_only = 0;
-		conn->reply_type = REPLY_CACHED;
+		//conn->reply_type = REPLY_CACHED;
 		free(target);
 	}
 	else {
@@ -2619,11 +2770,13 @@ static void process_get(struct connection* conn)
 			redirect(conn, "%s/", conn->url);
 			return;
 		}
-		else if (!S_ISREG(filestat.st_mode)) {
+
+		if (!S_ISREG(filestat.st_mode)) {
 			default_reply(conn, 403, "Forbidden", "Not a regular file.");
 			return;
 		}
 
+        conn->content_len = filestat.st_size;
 		conn->payload_size = filestat.st_size;
 		conn->payload_lastmod = filestat.st_mtime;
 		conn->reply_type = REPLY_FROMFILE;
@@ -2634,9 +2787,8 @@ static void process_get(struct connection* conn)
 	/* check for If-Modified-Since, may not have to send */
 	if_mod_since = hdrsearch( conn, "If-Modified-Since" );
 
-	if ((if_mod_since != NULL) &&
-        (strcmp(if_mod_since, lastmod) == 0))
-    {
+	if (if_mod_since != NULL && !strcmp(if_mod_since, lastmod)) {
+
 		conn->http_code = 304;
 		conn->header_length = xasprintf(&(conn->header),
             "HTTP/1.1 304 Not Modified\r\n"
@@ -2646,6 +2798,12 @@ static void process_get(struct connection* conn)
             "%s" /* keep-alive */
             "\r\n",
             rfc1123_date(date, now), server_hdr, keep_alive(conn));
+
+		if (conn->reply_type == REPLY_CACHED) {
+			if (conn->reply != NULL) { free(conn->reply); }
+			fprintf( logfile, "ASSSERT REPLY_CACHED\n" );
+			conn->reply = NULL;
+		}
 
 		conn->reply_length = 0;
 		conn->reply_type = REPLY_GENERATED;
@@ -2677,11 +2835,12 @@ static void process_get(struct connection* conn)
 			from = to - conn->range_end + 1;
 
 			/* clamp start */
-			if (from < 0)
-			{ from = 0; }
+			if (from < 0) {
+				from = 0;
+			}
+		} else {
+			errx(1, "internal error - from/to mismatch");
 		}
-		else
-		{ errx(1, "internal error - from/to mismatch"); }
 
 		if (from >= conn->payload_size) {
 			default_reply(conn, 416, "Requested Range Not Satisfiable",
@@ -2720,8 +2879,7 @@ static void process_get(struct connection* conn)
 			fprintf( logfile, "sending %llu-%llu/%llu\n",
 			    llu(from), llu(to), llu(conn->payload_size));
 		}
-	}
-	else {
+	} else {
 		/* no range stuff */
 		conn->reply_length = conn->payload_size;
 		conn->header_length = xasprintf(&(conn->header),
@@ -2745,7 +2903,7 @@ static void process_get(struct connection* conn)
 /* Process a POST request. */
 static void process_post(struct connection* conn)
 {
-	if (conn->content_len < MAX_REQUEST_LENGTH) {
+	if (conn->content_len < MAX_POST_LENGTH) {
 
         conn->tuples_total = parse_tuples(
             conn, conn->tuples, conn->body, '=', "&", MAX_TUPLES
@@ -2753,6 +2911,7 @@ static void process_post(struct connection* conn)
 
         if (conn->tuples_total > 0) {
 
+#ifdef ENABLE_GUESTBOOK
             if (fill_guestbook( conn )) {
                 if ( postfile_name ) {
                     free(conn->url);
@@ -2765,12 +2924,16 @@ static void process_post(struct connection* conn)
                     (*++sptr) = '\0';
                 }
                 process_get( conn );
-
-            } else {
+           } else {
 			    default_reply(conn, 500, "Internal Server Error",
                     "Your request was dropped because of a server error.");
                 conn->state = SEND_HEADER;
-            }
+		   }
+#else
+		    default_reply(conn, 400, "Bad Request",
+		        "You sent a request that the server couldn't understand.");
+	        conn->state = SEND_HEADER;
+#endif
         } else {
 		    default_reply(conn, 400, "Bad Request",
 		        "You sent a request that the server couldn't understand.");
@@ -2791,12 +2954,26 @@ static void process_request(struct connection* conn)
 	if (!parse_request(conn)) {
 		default_reply(conn, 400, "Bad Request",
             "You sent a request that the server couldn't understand.");
+		/* advance state */
+		conn->state = SEND_HEADER;
+		return;
 	}
-	else if (!parse_auth(conn)) {
-		default_reply(conn, 403, "Forbidden",
-            "You sent a request that the server couldn't allow.");
+
+	conn->host = hdrsearch( conn, "Host" );
+
+	/* work out path of file being requested */
+	if (!decode_url( conn )) { return; }
+
+	log_connection( conn, 1 );
+
+#ifdef ENABLE_PASSWORD
+	if (use_password && !parse_auth(conn)) {
+		conn->state = SEND_HEADER;
+		return;
 	}
-	else if (strcmp(conn->method, "GET") == 0) {
+#endif
+
+	if (strcmp(conn->method, "GET") == 0) {
 		process_get(conn);
 	}
 	else if (strcmp(conn->method, "HEAD") == 0) {
@@ -2807,10 +2984,11 @@ static void process_request(struct connection* conn)
 		process_post(conn);
 	}
 	else if ((strcmp(conn->method, "OPTIONS") == 0) ||
-	         (strcmp(conn->method, "TRACE") == 0) ||
-	         (strcmp(conn->method, "PUT") == 0) ||
-	         (strcmp(conn->method, "DELETE") == 0) ||
-	         (strcmp(conn->method, "CONNECT") == 0)) {
+         (strcmp(conn->method, "TRACE") == 0) ||
+         (strcmp(conn->method, "PUT") == 0) ||
+         (strcmp(conn->method, "DELETE") == 0) ||
+         (strcmp(conn->method, "CONNECT") == 0))
+	{
 		default_reply(conn, 501, "Not Implemented",
 		    "The method you specified (%s) is not implemented.",
 		    conn->method);
@@ -2832,8 +3010,6 @@ static void poll_recv_request(struct connection* conn)
 	ssize_t recvd;
 
 	assert(conn->state == RECV_REQUEST);
-
-	conn->content_len = 0;
 
 	recvd = recv(conn->socket, buf, sizeof(buf), 0);
 
@@ -2858,7 +3034,8 @@ static void poll_recv_request(struct connection* conn)
 		return;
 	}
 
-	conn->last_active = now;
+	update_clock( conn );
+
 	/* append to conn->request */
 	assert(recvd > 0);
 
@@ -2891,7 +3068,7 @@ static void poll_recv_request(struct connection* conn)
 
         if (conn->content_len < 1) {
             default_reply(conn, 400, "Bad Request",
-                "You requested an invalid URL: %s", conn->url);
+                "Your request is malformed: %s", conn->url);
 		    conn->state = SEND_HEADER;
         } else {
 
@@ -2944,7 +3121,7 @@ static void poll_send_header(struct connection* conn)
         conn->header_length - conn->header_sent,
         0);
 
-	conn->last_active = now;
+	update_clock( conn );
 
 	if (debug) {
 		printf(
@@ -2993,12 +3170,14 @@ static void poll_send_header(struct connection* conn)
  * Returns the number of bytes sent, 0 on closure, -1 if send() failed, -2 if
  * read error.
  */
-static ssize_t send_from_file(const int s, const int fd,
-                              off_t ofs, size_t size)
+static ssize_t send_from_file(const int s, const int fd, off_t ofs, size_t nbytes)
 {
+	/* Limit truly ridiculous (LARGEFILE) requests. */
+	if (nbytes > (1 << 23)) { nbytes = 1 << 20; }
+
 #ifdef __FreeBSD__
-	off_t sent;
-	int ret = sendfile(fd, s, ofs, size, NULL, &sent, 0);
+	off_t sent = 0;
+	int ret = sendfile(fd, s, ofs, nbytes, NULL, &sent, 0);
 
 	/* It is possible for sendfile to send zero bytes due to a blocking
 	 * condition.  Handle this correctly.
@@ -3014,26 +3193,23 @@ static ssize_t send_from_file(const int s, const int fd,
 		{ return -1; }
 	}
 	else
-	{ return size; }
+	{ return nbytes; }
 
-#else
-#if defined(__linux) || defined(__sun__)
-
-	/* Limit truly ridiculous (LARGEFILE) requests. */
-	if (size > 1 << 20) { size = 1 << 20; }
-
-	return sendfile(s, fd, &ofs, size);
+#elif defined(__linux) || defined(__sun__)
+	//fprintf(logfile, "Expecting %zu bytes on fd %d\n", nbytes, fd);
+	return sendfile(s, fd, &ofs, nbytes);
 #else
 	/* Fake sendfile() with read(). */
-# ifndef min
+#ifndef min
 #  define min(a,b) ( ((a)<(b)) ? (a) : (b) )
-# endif
+#endif
 	char buf[1 << 15];
-	size_t amount = min(sizeof(buf), size);
+
+	size_t amount = min(sizeof(buf), nbytes);
 	ssize_t numread;
 
 	if (lseek(fd, ofs, SEEK_SET) == -1)
-	{ err(1, "fseek(%d)", (int)ofs); }
+		err(1, "fseek(%d)", (int)ofs);
 
 	numread = read( fd, buf, amount );
 
@@ -3041,45 +3217,64 @@ static ssize_t send_from_file(const int s, const int fd,
 		fprintf(stderr, "premature eof on fd %d\n", fd);
 		return -1;
 	}
-	else if (numread == -1) {
+
+	if (numread == -1) {
 		fprintf(stderr, "error reading on fd %d: %s", fd, strerror(errno));
 		return -1;
 	}
-	else if ((size_t)numread != amount) {
-		fprintf(stderr, "read %zd bytes, expecting %zu bytes on fd %d\n",
-		        numread, amount, fd);
+
+	if ((size_t)numread != amount) {
+		fprintf(stderr, "read %zd bytes, expecting %zu bytes on fd %d\n", numread, amount, fd);
 		return -1;
 	}
-	else
-	{ return send(s, buf, amount, 0); }
 
-#endif
+	//fprintf(logfile, "read %zd bytes, expecting %zu bytes on fd %d\n", numread, amount, fd);
+	return send(s, buf, amount, 0);
 #endif
 }
 
 /* Sending reply. */
 static void poll_send_reply(struct connection* conn)
 {
+	size_t nbytes = (size_t)(conn->reply_length - conn->reply_sent);
 	ssize_t sent;
 
 	assert(conn->state == SEND_REPLY);
 	assert(!conn->header_only);
 
 	errno = 0;
+	assert(conn->reply_length >= conn->reply_sent);
+
+	/*
+	if (conn->reply_type == REPLY_FROMFILE) {
+		fprintf( logfile, "send_from_file REPLY_FROMFILE %d\n", conn->reply_blksz );
+	}
+	*/
 
 	if (conn->reply_type == REPLY_CACHED ||
 		conn->reply_type == REPLY_GENERATED)
 	{
-		assert(conn->reply_length >= conn->reply_sent);
-		sent = send(conn->socket,
+		sent = send(
+			conn->socket,
 			conn->reply + conn->reply_start + conn->reply_sent,
-			(size_t)(conn->reply_length - conn->reply_sent), 0);
+			nbytes, 0
+		);
 	}
 	else {
-		assert(conn->reply_length >= conn->reply_sent);
-		sent = send_from_file(conn->socket, conn->reply_fd,
-			  conn->reply_start + conn->reply_sent,
-			  (size_t)(conn->reply_length - conn->reply_sent));
+		if (conn->reply_blksz > 0) {
+			if (conn->reply_blksz < nbytes)
+				nbytes = conn->reply_blksz;
+
+			if (conn->reply_sent < 1 && conn->reply_length > conn->reply_burst) {
+				nbytes = conn->reply_burst;
+			}
+		}
+
+		sent = send_from_file(
+			conn->socket, conn->reply_fd,
+			conn->reply_start + conn->reply_sent, nbytes
+			//(size_t)(conn->reply_length - conn->reply_sent));
+		);
 
 		if (debug && (sent < 1)) {
 			printf("send_from_file returned %lld (errno=%d %s)\n",
@@ -3087,13 +3282,15 @@ static void poll_send_reply(struct connection* conn)
         }
 	}
 
-	conn->last_active = now;
+	update_clock( conn );
 
 	if ( debug ) {
+		//fprintf(logfile,"poll_send_reply(%d) sent %d: %llu+[%llu-%llu] of %llu\n",
 		printf("poll_send_reply(%d) sent %d: %llu+[%llu-%llu] of %llu\n",
 		       conn->socket, (int)sent, llu(conn->reply_start),
 		       llu(conn->reply_sent), llu(conn->reply_sent + sent - 1),
 		       llu(conn->reply_length));
+		//fflush( logfile );
 	}
 
 	/* handle any errors (-1) or closure (0) in send() */
@@ -3194,7 +3391,10 @@ static void httpd_poll(void)
 	}
 
 	/* update time */
-	now = time(NULL);
+	//now = time(NULL);
+	gettimeofday( &chrono, 0L );
+
+	now = chrono.tv_sec;
 
 	/* poll connections that select() says need attention */
 	if (FD_ISSET(sockin, &recv_set))
@@ -3217,8 +3417,17 @@ static void httpd_poll(void)
 
 		case SEND_REPLY:
 			if (FD_ISSET(conn->socket, &send_set))
-			{ poll_send_reply(conn); }
-
+			{
+				if ( !use_throttling || conn->reply_blksz < 1) {
+					poll_send_reply(conn);
+				} else if ( use_millisecs ) {
+					if (memcmp( &chrono, &conn->last_chrono, CHRONO_SZ ) > 0) {
+						poll_send_reply(conn);
+					}
+				} else if (now > conn->last_active) {
+					poll_send_reply(conn);
+				}
+			}
 			break;
 
 		case DONE:
@@ -3324,6 +3533,7 @@ static void daemonize_finish(void)
 	{ close(fd_null); }
 }
 
+#ifdef ENABLE_PIDFILE
 /* [->] pidfile helpers, based on FreeBSD src/lib/libutil/pidfile.c,v 1.3
  * Original was copyright (c) 2005 Pawel Jakub Dawidek <pjd@FreeBSD.org>
  */
@@ -3356,6 +3566,7 @@ static int pidfile_read(void)
 	{ err(1, "read from pidfile failed"); }
 
 	xclose(fd);
+
 	buf[i] = '\0';
 
 	if (!str_to_num(buf, &pid)) {
@@ -3400,6 +3611,7 @@ static void pidfile_create(void)
 	}
 }
 /* [<-] end of pidfile helpers. */
+#endif
 
 /* Close all sockets and FILEs and exit. */
 static void stop_running(int sig unused)
@@ -3407,64 +3619,82 @@ static void stop_running(int sig unused)
 	running = 0;
 }
 
+static uid_t get_dropto_uid(const char* name)
+{
+	struct passwd* p = getpwnam(name);
+
+	if (p) { return p->pw_uid; }
+
+	p = getpwuid((uid_t)xstr_to_num(name));
+
+	if (p) { return p->pw_uid; }
+
+	errx(1, "no such uid: `%s'", name);
+}
+
+static gid_t get_dropto_gid(const char* name)
+{
+	struct group* g = getgrnam(name);
+
+	if (g) { return g->gr_gid; }
+
+	g = getgrgid((gid_t)xstr_to_num(name));
+
+	if (g) { return g->gr_gid; }
+
+	errx(1, "no such gid: `%s'", name);
+}
+
 static void parse_commandline(const int argc, char* argv[])
 {
+	const char *cfgfile = config_file;
 	const char *host = NULL;
 	const char *url = NULL;
 	char *rootdir = NULL;
 	char *value = NULL;
+	int len= 0, i = 0;
 	int optidx = 1;
-	size_t len = 0;
-	int i = 0;
 
-	memset( redirects, 0, sizeof(redirects) );
 	memset( mimetypes, 0, sizeof(mimetypes) );
-	memset( passwords, 0, sizeof(passwords) );
 
-	if (!parse_inifile( "/etc/dawnhttpd/settings.ini" )) {
+#ifdef ENABLE_PASSWORD
+	memset( passwords, 0, sizeof(passwords) );
+#endif
+
+    inifile_total = load_cfgfile( cfgfile, &inibuf, inifile, MAX_TUPLES );
+    if (!inifile_total) {
 		errx(1, "Invalid ini settings file" );
 	}
 
-	if (argv[1] && dir_exists( argv[1])) {
-		optidx = 2;
-		wwwroot = xstrdup(argv[1]);
-	} else {
-		rootdir = inisearch( "General/wwwroot", "/var/www/htdocs" );
-		wwwroot = xstrdup(rootdir);
-	}
+	rootdir = inisearch( "General/wwwroot", "/var/www/htdocs" );
+	wwwroot = xstrdup(rootdir);
+
+	wwwrealm = inisearch( "General/realm", "dawnhttpd.io" );
+	wwwrealm = xstrdup(wwwrealm);
+
+	if (!strcmp(wwwroot, "/") || !dir_exists(wwwroot))
+		errx(1, "Invalid www rootdir specified !" );
 
 	/* Strip ending slash. */
 	if ((len = strlen(wwwroot)) > 0) {
-		if (wwwroot[len - 1] == '/') {
-			wwwroot[len - 1] = '\0';
+		if (wwwroot[len-1] == '/') {
+			wwwroot[len-1] = '\0';
 		}
 	}
 
-	if (!wwwroot)
-		errx(1, "No www rootdir specified !" );
-
 	wwwrootlen = strlen(wwwroot);
 
+#ifdef ENABLE_SLOCATE
 	locate_dbpath = inisearch( "Locate/path", NULL );
 	locate_maxhits = inisearch( "Locate/maximum", NULL );
 
 	if ( locate_maxhits ) {
         int max = atoi(locate_maxhits);
-
-        if (max < 50 || max > 2500) {
+        if (max < 25 || max > 2500) {
 			errx(1, "Invalid locate search maximum");
         }
     }
-
-	value = inisearch( "General/use-ipv4", "yes" );
-
-	if (!strcasecmp( value, "yes" )) {
-		use_inet6 = 0;
-		bindaddr = inisearch( "General/ipv4-addr", NULL );
-	} else {
-		bindaddr = inisearch( "General/ipv6-addr", NULL );
-		use_inet6 = 1;
-	}
+#endif
 
 	value = inisearch( "General/max-conn", "-1" );
 	max_connections = (int)xstr_to_num( value );
@@ -3472,14 +3702,46 @@ static void parse_commandline(const int argc, char* argv[])
 	value = inisearch( "General/port", getuid() ? "8080" : "80" );
 	bindport = (int)xstr_to_num( value );
 
-	if ((value = inisearch( "General/daemon", NULL )))
-		want_daemon = !strcasecmp( value, "yes" );
+	if (ini_evaluate( "General/use-ipv4", "yes", "yes" )) {
+		bindaddr = inisearch( "General/ipv4-addr", "127.0.0.1" );
+	} else {
+		bindaddr = inisearch( "General/ipv6-addr", NULL );
+		use_inet6 = 1;
+	}
 
-	pidfile_name = inisearch( "General/pidfile", NULL );
+	want_daemon = ini_evaluate( "General/daemon", "yes", NULL );
+	want_cache = ini_evaluate( "General/use-cache", "yes", NULL );
+	want_chroot = ini_evaluate( "General/use-chroot", "yes", NULL );
+	want_listing = ini_evaluate( "General/use-listing", "yes", "yes" );
+	want_server_id = ini_evaluate( "General/use-server-id", "yes", NULL );
 	mimefile_name = inisearch( "General/mimetypes", NULL );
 
-	if ((value = inisearch( "General/use-cache", NULL )))
-		want_cache = !strcasecmp( value, "yes" );
+	use_redirect = ini_evaluate( "Redirect/enabled", "yes", NULL );
+	use_throttling = ini_evaluate( "Throttle/enabled", "yes", NULL );
+	use_millisecs = ini_evaluate( "Throttle/millisecs", "yes", NULL );
+
+	value = inisearch( "Throttle/burst", "2048" );
+	burst_size = (int)xstr_to_num( value ) * 1024;
+
+#ifdef ENABLE_PASSWORD
+	use_password = ini_evaluate( "Password/enabled", "yes", NULL );
+	password_file = inisearch( "Password/filename", NULL );
+
+	if ((password_salt = inisearch( "Password/salt", NULL )))
+		password_saltlen = strlen( password_salt );
+
+    if (use_password && !password_salt)
+        errx(1, "Password salt missing");
+#endif
+
+	if (ini_evaluate( "Dropto/enabled", "yes", NULL )) {
+
+		if ((value = inisearch( "Dropto/user", NULL )))
+			drop_uid = get_dropto_uid( value );
+
+		if ((value = inisearch( "Dropto/group", NULL )))
+			drop_gid = get_dropto_gid( value );
+	}
 
 	/* walk through the remainder of the arguments (if any) */
 	for (i = optidx; i < argc; i++) {
@@ -3502,11 +3764,33 @@ static void parse_commandline(const int argc, char* argv[])
 		else if (strcmp(argv[i], "--stdout") == 0) {
 			logfile_name = NULL;
 		}
+		else if (strcmp(argv[i], "--logfile") == 0) {
+			if (++i >= argc)
+			{ errx(1, "missing logfile after --log"); }
+			logfile_name = argv[i];
+		}
+#ifdef ENABLE_PIDFILE
+		else if (strcmp(argv[i], "--pidfile") == 0) {
+			if (++i >= argc)
+			{ errx(1, "missing filename after --pidfile"); }
+			pidfile_name = xstrdup(argv[i]);
+		}
+#endif
+		else if (strcmp(argv[i], "--no-daemon") == 0) {
+			want_daemon = 0;
+		}
+		else if (strcmp(argv[i], "--no-keepalive") == 0) {
+			want_keepalive = 0;
+		}
 		else if (strcmp(argv[i], "--chroot") == 0) {
 			want_chroot = 1;
 		}
-		else if (strcmp(argv[i], "--daemon") == 0) {
-			want_daemon = 1;
+#if 0
+		else if (strcmp(argv[i], "--no-server-id") == 0) {
+			want_server_id = 0;
+		}
+		else if (strcmp(argv[i], "--no-listing") == 0) {
+			want_listing = 1;
 		}
 		else if (strcmp(argv[i], "--index") == 0) {
 			if (++i >= argc)
@@ -3519,65 +3803,49 @@ static void parse_commandline(const int argc, char* argv[])
 			{ errx(1, "missing filename after --post"); }
 	        postfile_name = argv[i];
 		}
-		else if (strcmp(argv[i], "--no-listing") == 0) {
-			no_listing = 1;
-		}
 		else if (strcmp(argv[i], "--mimetypes") == 0) {
 			if (++i >= argc)
 			{ errx(1, "missing filename after --mimetypes"); }
 	        mimefile_name = argv[i];
+		}
+		else if (strcmp(argv[i], "--forward") == 0) {
+
+			if (++i >= argc)
+			{ errx(1, "missing host after --forward"); }
+			host = argv[i];
+
+			if (++i >= argc)
+			{ errx(1, "missing url after --forward"); }
+			url = argv[i];
+
+			if (!add_redirect( host, url )) {
+				errx(1, "too many redirects --forward");
+			}
 		}
 		else if (strcmp(argv[i], "--default-mimetype") == 0) {
 			if (++i >= argc)
 			{ errx(1, "missing string after --default-mimetype"); }
 			default_mimetype = argv[i];
 		}
+#endif
 		else if (strcmp(argv[i], "--uid") == 0) {
-			struct passwd* p;
 
 			if (++i >= argc)
 			{ errx(1, "missing uid after --uid"); }
 
-			p = getpwnam(argv[i]);
-
-			if (!p) {
-				p = getpwuid((uid_t)xstr_to_num(argv[i]));
-			}
-
-			if (!p)
-			{ errx(1, "no such uid: `%s'", argv[i]); }
-
-			drop_uid = p->pw_uid;
+			drop_uid = get_dropto_uid( argv[i] );
 		}
 		else if (strcmp(argv[i], "--gid") == 0) {
-			struct group* g;
 
 			if (++i >= argc)
 			{ errx(1, "missing gid after --gid"); }
 
-			g = getgrnam(argv[i]);
-
-			if (!g) {
-				g = getgrgid((gid_t)xstr_to_num(argv[i]));
-			}
-
-			if (!g) {
-				errx(1, "no such gid: `%s'", argv[i]);
-			}
-
-			drop_gid = g->gr_gid;
-		}
-		else if (strcmp(argv[i], "--pidfile") == 0) {
-			if (++i >= argc)
-			{ errx(1, "missing filename after --pidfile"); }
-			pidfile_name = argv[i];
-		}
-		else if (strcmp(argv[i], "--no-keepalive") == 0) {
-			want_keepalive = 0;
+			drop_gid = get_dropto_gid( argv[i] );
 		}
 		else if (strcmp(argv[i], "--accf") == 0) {
 			want_accf = 1;
 		}
+#ifdef ENABLE_GUESTBOOK
 		else if (strcmp(argv[i], "--guestbook") == 0) {
 
 			const char* gbook_filename;
@@ -3600,30 +3868,16 @@ static void parse_commandline(const int argc, char* argv[])
 			if (!load_file( gbook_template, &guestbook_template, (1 << 12))) {
 				errx(1, "invalid guestbook template file --guestbook");
 			}
-		} else if (strcmp(argv[i], "--forward") == 0) {
-
-			if (++i >= argc)
-			{ errx(1, "missing host after --forward"); }
-			host = argv[i];
-
-			if (++i >= argc)
-			{ errx(1, "missing url after --forward"); }
-			url = argv[i];
-
-			if (!add_redirect( host, url )) {
-				errx(1, "too many redirects --forward");
-			}
-		} else if (strcmp(argv[i], "--forward-all") == 0) {
+		}
+#endif
+		else if (strcmp(argv[i], "--forward-all") == 0) {
 
 			if (++i >= argc)
 			{ errx(1, "missing url after --forward-all"); }
 
 			redirect_all_url = argv[i];
 		}
-		else if (strcmp(argv[i], "--no-server-id") == 0) {
-			want_server_id = 0;
-		}
-#ifdef HAVE_INET6
+#ifdef ENABLE_INET6
 		else if (strcmp(argv[i], "--ipv6") == 0) {
 			use_inet6 = 1;
 		}
@@ -3635,10 +3889,20 @@ static void parse_commandline(const int argc, char* argv[])
 	index_name_len = strlen( index_name );
 
 	if ( mimefile_name ) {
-		if (!parse_mimefile( mimefile_name )) {
+    	mimetypes_total = load_cfgfile( mimefile_name, &mimebuf, mimetypes, MAX_TUPLES );
+    	if (!mimetypes_total) {
 			errx(1, "Invalid mimetype file");
 		}
 	}
+
+#ifdef ENABLE_PASSWORD
+	if ( password_file ) {
+		passwords_total = load_cfgfile( password_file, &passwdbuf, passwords, MAX_TUPLES );
+    	if (!passwords_total) {
+			errx(1, "Invalid password file");
+		}
+	}
+#endif
 }
 
 void init_memcache()
@@ -3692,8 +3956,16 @@ void init_memcache()
 /* Execution starts here. */
 int main(int argc, char** argv)
 {
-	now = time(NULL);
+	int rc = 0, i = 0;
 
+	if (argv[1]) {
+		if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
+			usage(argv[0]);
+			exit(0);
+		}
+	}
+
+	now = time(NULL);
 	logfile = stdout;
 
 	parse_commandline( argc, argv );
@@ -3721,15 +3993,12 @@ int main(int argc, char** argv)
         server_hdr = xstrdup("");
     }
 
-	init_sockin();
+	for (i=0; i<3 && !rc; i++)
+		rc = init_sockin( i >= 2 );
 
-	if ( want_cache ) {
-		init_memcache();
-	}
+	if ( want_cache ) { init_memcache(); }
 
-	if ( want_daemon ) {
-        daemonize_start();
-    }
+	if ( want_daemon ) { daemonize_start(); }
 
 	/* signals */
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
@@ -3776,8 +4045,16 @@ int main(int argc, char** argv)
 		fprintf( logfile, "set uid to %d\n", (int)drop_uid);
 	}
 
-	/* create pidfile */
+#ifdef ENABLE_PIDFILE
+	if (want_chroot) {
+		if (pidfile_name) { free(pidfile_name); }
+		xasprintf( &pidfile_name, "%s/dawnhttpd.pid", wwwroot);
+	} else if ( !pidfile_name) {
+		xasprintf( &pidfile_name, "%s", "/var/log/dawnhttpd.pid");
+	}
+
 	if (pidfile_name) { pidfile_create(); }
+#endif
 
 	if (want_daemon) { daemonize_finish(); }
 
@@ -3787,12 +4064,17 @@ int main(int argc, char** argv)
 	/* clean exit */
 	xclose(sockin);
 
+#ifdef ENABLE_GUESTBOOK
 	if (guestbook_file != NULL) {
         fflush(guestbook_file);
         fclose(guestbook_file);
     }
+#endif
 
-	now = time(NULL);
+	//now = time(NULL);
+	gettimeofday( &chrono, 0L );
+
+	now = chrono.tv_sec;
 
 	/* usage stats */
 	{
@@ -3821,9 +4103,12 @@ int main(int argc, char** argv)
 		}
 	}
 
+#ifdef ENABLE_PIDFILE
 	if (pidfile_name != NULL) {
         pidfile_remove();
+		free(pidfile_name);
     }
+#endif
 
 	if (logfile != NULL) {
         fflush(logfile);
@@ -3832,14 +4117,18 @@ int main(int argc, char** argv)
 
 	/* free the mallocs */
 	{
-        free_tuples( redirects );
+#ifdef ENABLE_PASSWORD
+        free_tuples( passwords );
+#endif
         free_tuples( mimetypes );
         free_tuples( inifile );
 
+        //free(passbuf);
         free(mimebuf);
         free(inibuf);
 
 		free(keep_alive_field);
+		free(wwwrealm);
 		free(wwwroot);
 		free(server_hdr);
 	}
