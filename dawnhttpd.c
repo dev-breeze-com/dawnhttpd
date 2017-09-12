@@ -253,7 +253,7 @@ struct connection {
 	in_addr_t client;
 #endif
 	time_t last_active;
-	struct timeval last_chrono;
+	struct timeval chrono;
 	enum {
 	    RECV_REQUEST=0,   /* receiving request */
 	    SEND_HEADER,    /* sending generated header */
@@ -298,7 +298,7 @@ struct connection {
 	enum { REPLY_GENERATED=0, REPLY_CACHED, REPLY_FROMFILE } reply_type;
 	char* reply;
 	int reply_fd, reply_blksz, reply_burst;
-	float reply_msecs;
+	float reply_msecs, reply_usecs;
 	off_t reply_start, reply_length, reply_sent;
 	off_t total_sent; /* header + body = total, for logging */
 };
@@ -347,9 +347,10 @@ static char* keep_alive_field = NULL;
  */
 static int CHRONO_SZ = sizeof(struct timeval);
 static struct timeval chrono;
-static int use_millisecs = 0;
+static int video_burstsize = 0;
+static int audio_burstsize = 0;
 static int use_throttling = 0;
-static int burst_size = 0;
+static int use_millisecs = 0;
 static time_t now;
 
 /* Defaults can be overridden on the command-line */
@@ -374,7 +375,7 @@ static char* wwwrealm = NULL;
 static char* server_hdr = NULL;
 
 static char* pidfile_name = NULL; /* NULL = no pidfile */
-static char* logfile_name = "/var/log/dawnhttpd.log";
+static char* logfile_name = NULL;
 static FILE* logfile = NULL;
 
 static int want_cache = 0;
@@ -397,6 +398,9 @@ static volatile int running = 1; /* signal handler sets this to false */
 
 #define INVALID_UID ((uid_t) -1)
 #define INVALID_GID ((gid_t) -1)
+
+#define TIMERCMP(x,y) ((x.tv_sec > y.tv_sec) ? 1 : \
+		((x.tv_sec == y.tv_sec && x.tv_usec > y.tv_usec) ? 1 : 0))
 
 static uid_t drop_uid = INVALID_UID;
 static gid_t drop_gid = INVALID_GID;
@@ -816,11 +820,22 @@ static const char* get_address_text(const void* addr)
 
 static void update_clock(struct connection *conn)
 {
+	int usecs = 0;
+
 	conn->last_active = now;
 
-	if ( use_millisecs ) {
-		memcpy( &conn->last_chrono, &chrono, CHRONO_SZ );
-		conn->last_chrono.tv_usec += conn->reply_msecs * 100 * 1000;
+	if (use_millisecs && TIMERCMP( chrono, conn->chrono ) > 0) {
+
+		memcpy( &(conn->chrono), &chrono, CHRONO_SZ );
+
+		usecs = chrono.tv_usec + conn->reply_usecs;
+
+		if (usecs < 999999) {
+			conn->chrono.tv_usec = usecs;
+		} else {
+			conn->chrono.tv_sec += 1;
+			conn->chrono.tv_usec = usecs - 1000000;
+		}
 	}
 }
 
@@ -1182,6 +1197,7 @@ static struct connection* new_connection(void)
 	conn->reply_length = 0;
 	conn->reply_blksz = 0;
 	conn->reply_msecs = 0.1;
+	conn->reply_usecs = 100000;
 	conn->reply_burst = 1 << 20;
 	conn->reply_sent = 0;
 	conn->total_sent = 0;
@@ -1430,6 +1446,7 @@ static void recycle_connection(struct connection* conn)
 	conn->reply_length = 0;
 	conn->reply_blksz = 0;
 	conn->reply_msecs = 0.1;
+	conn->reply_usecs = 100000;
 	conn->reply_burst = 1 << 20;
 	conn->reply_sent = 0;
 	conn->total_sent = 0;
@@ -2697,28 +2714,44 @@ static void process_get(struct connection* conn)
 
 			assert( strlen(blksize) < 16 );
 
-			if (strstr(mimetype, "video/"))
-				conn->reply_burst = burst_size;
+			if (strstr(mimetype, "video/")) {
+				conn->reply_burst = video_burstsize;
+			} else {
+				conn->reply_burst = audio_burstsize;
+			}
 
-			if (use_millisecs && (msecs = strchr( blksize, ',' ))) {
+			if (use_millisecs && (msecs = strchr( blksize, '/' ))) {
 				conn->reply_msecs = atoi( msecs+1 );
+				conn->reply_usecs = conn->reply_msecs * 1000;
 				conn->reply_msecs /= 1000;
+
 				strncpy( throttle, blksize, msecs-blksize );
 				throttle[msecs-blksize] = '\0';
-				conn->reply_blksz = atoi( throttle ) * 1024;
-//		fprintf( logfile, "Throttling '%s' '%s' [%d, %02f, %d]\n", throttle, blksize, conn->reply_burst, conn->reply_msecs, conn->reply_blksz);
 
-			} else {
+				conn->reply_blksz = atoi( throttle ) * 1024;
+			}
+			else {
 				conn->reply_blksz = atoi( blksize ) * 1024;
 			}
 
 			kbps = conn->reply_blksz * 8;
 
-			if ( use_millisecs ) {
-				kbps /= conn->reply_msecs;
-			}
+			if ( use_millisecs ) { kbps /= conn->reply_msecs; }
 
-			fprintf( logfile, "Throttling '%s' at %d Kbps [%d, %02f]\n", mimetype, kbps, conn->reply_burst, conn->reply_msecs);
+			fprintf(
+				logfile,
+				"Throttling '%s' at %d Kbps [%d, %02f]\n",
+				mimetype, kbps, conn->reply_burst, conn->reply_msecs
+			);
+
+			if (kbps < 4096) {
+				fprintf(
+					logfile,
+					"Throttle value too small for '%s' -- reset to %d Kbps\n",
+					mimetype, kbps
+				);
+				kbps = 4096;
+			}
 			fflush( logfile );
 		}
 		free(throttle);
@@ -3197,6 +3230,7 @@ static ssize_t send_from_file(const int s, const int fd, off_t ofs, size_t nbyte
 
 #elif defined(__linux) || defined(__sun__)
 	//fprintf(logfile, "Expecting %zu bytes on fd %d\n", nbytes, fd);
+	//fflush(logfile);
 	return sendfile(s, fd, &ofs, nbytes);
 #else
 	/* Fake sendfile() with read(). */
@@ -3244,12 +3278,6 @@ static void poll_send_reply(struct connection* conn)
 
 	errno = 0;
 	assert(conn->reply_length >= conn->reply_sent);
-
-	/*
-	if (conn->reply_type == REPLY_FROMFILE) {
-		fprintf( logfile, "send_from_file REPLY_FROMFILE %d\n", conn->reply_blksz );
-	}
-	*/
 
 	if (conn->reply_type == REPLY_CACHED ||
 		conn->reply_type == REPLY_GENERATED)
@@ -3421,7 +3449,7 @@ static void httpd_poll(void)
 				if ( !use_throttling || conn->reply_blksz < 1) {
 					poll_send_reply(conn);
 				} else if ( use_millisecs ) {
-					if (memcmp( &chrono, &conn->last_chrono, CHRONO_SZ ) > 0) {
+					if (TIMERCMP( chrono, conn->chrono ) > 0) {
 						poll_send_reply(conn);
 					}
 				} else if (now > conn->last_active) {
@@ -3714,14 +3742,25 @@ static void parse_commandline(const int argc, char* argv[])
 	want_chroot = ini_evaluate( "General/use-chroot", "yes", NULL );
 	want_listing = ini_evaluate( "General/use-listing", "yes", "yes" );
 	want_server_id = ini_evaluate( "General/use-server-id", "yes", NULL );
+
 	mimefile_name = inisearch( "General/mimetypes", NULL );
+	logfile_name = inisearch( "General/logfile", "/var/log/dawnhttpd.log" );
 
 	use_redirect = ini_evaluate( "Redirect/enabled", "yes", NULL );
 	use_throttling = ini_evaluate( "Throttle/enabled", "yes", NULL );
 	use_millisecs = ini_evaluate( "Throttle/millisecs", "yes", NULL );
 
-	value = inisearch( "Throttle/burst", "2048" );
-	burst_size = (int)xstr_to_num( value ) * 1024;
+	value = inisearch( "Throttle/audio-burst", "1024" );
+	audio_burstsize = (int)xstr_to_num( value ) * 1024;
+
+	value = inisearch( "Throttle/video-burst", "2048" );
+	video_burstsize = (int)xstr_to_num( value ) * 1024;
+
+	if (audio_burstsize < 1024 || audio_burstsize < 8192)
+        errx(1, "Invalid audio burst size");
+
+	if (video_burstsize < 1024 || video_burstsize < 8192)
+        errx(1, "Invalid video burst size");
 
 #ifdef ENABLE_PASSWORD
 	use_password = ini_evaluate( "Password/enabled", "yes", NULL );
@@ -3763,11 +3802,6 @@ static void parse_commandline(const int argc, char* argv[])
 		}
 		else if (strcmp(argv[i], "--stdout") == 0) {
 			logfile_name = NULL;
-		}
-		else if (strcmp(argv[i], "--logfile") == 0) {
-			if (++i >= argc)
-			{ errx(1, "missing logfile after --log"); }
-			logfile_name = argv[i];
 		}
 #ifdef ENABLE_PIDFILE
 		else if (strcmp(argv[i], "--pidfile") == 0) {
@@ -3821,6 +3855,11 @@ static void parse_commandline(const int argc, char* argv[])
 			if (!add_redirect( host, url )) {
 				errx(1, "too many redirects --forward");
 			}
+		}
+		else if (strcmp(argv[i], "--logfile") == 0) {
+			if (++i >= argc)
+			{ errx(1, "missing logfile after --log"); }
+			logfile_name = argv[i];
 		}
 		else if (strcmp(argv[i], "--default-mimetype") == 0) {
 			if (++i >= argc)
