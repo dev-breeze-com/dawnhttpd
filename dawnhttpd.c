@@ -800,7 +800,6 @@ static int make_safe_url(struct connection* conn)
 
 	url[pos] = '\0';
 
- //   printf( "URL='%s'\n", url);
 	conn->decoded_urllen = pos;
 
 	return (1);
@@ -2158,9 +2157,6 @@ static int parse_request(struct connection* conn)
 
 	assert(conn->request_length == strlen(conn->request));
 
-//printf( "Header %d '%s'\n", reqlen, conn->request );
-//fflush( stdout );
-
 	/* parse method */
 	for (sptr = bptr; i < reqlen && (*sptr) != ' '; sptr++, i++)
 		chr = (*sptr);
@@ -2170,9 +2166,6 @@ static int parse_request(struct connection* conn)
 	(*sptr) = '\0';
 	conn->method = bptr;
 	bptr = ++sptr;
-
-//printf( "METHOD '%s' '%s'\n", conn->method, bptr );
-//fflush( stdout );
 
 	for (sptr = conn->method; (*sptr); sptr++)
 		(*sptr) = (char)toupper( *sptr );
@@ -2185,92 +2178,15 @@ static int parse_request(struct connection* conn)
 	for (; (*sptr) != ' '; --sptr)
 		;
 
-#if 0
-	/* parse url */
-	for (sptr = bptr; i < reqlen && ((*sptr) != ' ' || chr == '\\'); sptr++, i++)
-		chr = (*sptr);
-
-	if (i >= reqlen) { return 0; } /* fail */
-#endif
-
 	(*sptr) = '\0';
 	conn->urllen = sptr - bptr;
 	conn->url = split_string( bptr, 0, conn->urllen );
 	bptr = ++sptr;
 
-//printf( "URL %d '%s' '%s'\n", conn->urllen, conn->url, bptr );
-//fflush( stdout );
-
-#if 0
-	for (bound1 = 0;
-			(bound1 < rlen) &&
-			(conn->request[bound1] != ' ');
-	        bound1++)
-	{
-	}
-
-	conn->method = split_string(conn->request, 0, bound1);
-	strntoupper(conn->method, bound1);
-
-	/* parse url */
-	for (;
-	        (bound1 < conn->request_length) &&
-	        (conn->request[bound1] == ' ');
-	        bound1++)
-		;
-
-	if (bound1 == conn->request_length) { return 0; } /* fail */
-
-	for (bound2 = bound1 + 1;
-	        (bound2 < conn->request_length) &&
-	        (conn->request[bound2] != ' ') &&
-	        (conn->request[bound2] != '\r') &&
-	        (conn->request[bound2] != '\n');
-	        bound2++)
-		;
-
-	conn->url = split_string(conn->request, bound1, bound2);
-	conn->urllen = bound2 - bound1;
-
-	/* parse protocol to determine conn_close */
-	if (conn->request[bound2] == ' ') {
-
-		char* proto;
-
-		for (bound1 = bound2;
-		        (bound1 < conn->request_length) &&
-		        (conn->request[bound1] == ' ');
-		        bound1++)
-			;
-
-		for (bound2 = bound1 + 1;
-		        (bound2 < conn->request_length) &&
-		        (conn->request[bound2] != ' ') &&
-		        (conn->request[bound2] != '\r');
-		        bound2++)
-			;
-
-		proto = split_string(conn->request, bound1, bound2);
-
-		if (strcasecmp(proto, "HTTP/1.1") == 0) {
-			conn->conn_close = 0;
-		}
-
-		free(proto);
-	}
-
-	sptr = &(conn->request[bound2+1]);
-	for (; (*sptr) == '\n' || (*sptr) == '\r'; sptr++);
-	conn->header = ++sptr;
-#endif
-
 	conn->conn_close = 0;
 	for (; (*sptr) != '\n' && (*sptr) != '\r'; sptr++);
 	for (; (*sptr) == '\n' || (*sptr) == '\r'; sptr++);
 	conn->header = sptr;
-
-//printf( "Header '%s'\n", sptr );
-//fflush( stdout );
 
     conn->headers_total = parse_tuples(
         conn, conn->headers, conn->header, ':', crnl, MAX_HEADERS
