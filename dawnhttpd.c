@@ -674,6 +674,7 @@ static void consolidate_slashes(char* s, size_t *urllen)
 {
 	size_t left = 0, right = 0;
 	int saw_slash = 0;
+
 	assert(s != NULL);
 
 	while (s[right] != '\0') {
@@ -684,8 +685,10 @@ static void consolidate_slashes(char* s, size_t *urllen)
 				saw_slash = 0;
 				s[left++] = s[right++];
 			}
-		}
-		else {
+		} else if (s[right] == '\\' && s[right+1] == ' ') {
+			++right;
+			s[left++] = s[right++];
+		} else {
 			if (s[right] == '/')
 			{ saw_slash++; }
 
@@ -797,6 +800,7 @@ static int make_safe_url(struct connection* conn)
 
 	url[pos] = '\0';
 
+ //   printf( "URL='%s'\n", url);
 	conn->decoded_urllen = pos;
 
 	return (1);
@@ -1382,7 +1386,7 @@ static void free_connection(struct connection* conn)
 
 	if (conn->request != NULL) { free(conn->request); }
 
-	if (conn->method != NULL) { free(conn->method); }
+	//if (conn->method != NULL) { free(conn->method); }
 
 	if (conn->url != NULL) { free(conn->url); }
 
@@ -1897,9 +1901,9 @@ static int parse_tuples(struct connection* conn, struct data_tuple* tuples[],
                         tuples[i]->key = NULL;
                     }
 
+                /*
                     if (debug)
                     { printf("VALUE[%d]=\"%s\"\n", i-1, tuples[i-1]->value); }
-                /*
                 */
                     bptr = ++sptr;
 				}
@@ -1956,13 +1960,16 @@ static int parse_tuples(struct connection* conn, struct data_tuple* tuples[],
 
 		if ( tuples[i]->key ) {
 
+			/*
 			if (debug)
 				{ printf("LAST TUPLES[%d]='%s'\n", i, tuples[i]->key ); }
+			*/
 
 			if (bptr && !tuples[i]->value) {
+				/*
 				if (debug)
 					{ printf("LAST VALUE TUPLES[%d]='%s'\n", i, bptr); }
-
+				*/
 				tuples[i++]->value = bptr;
 			}
 		}
@@ -2035,9 +2042,10 @@ static int load_file(const char* filename, char** buffer, int maximum)
 
 static int load_cfgfile(const char* path, char **buffer, struct data_tuple* tuples[], int maxsz)
 {
+	static const char* const crnl = "\r\n";
     int total = load_file( path, buffer, 1 << 15 );
     if (total > 0)
-        total = parse_tuples( 0L, tuples, (*buffer), '=', "\r\n", maxsz );
+        total = parse_tuples( 0L, tuples, (*buffer), '=', crnl, maxsz );
     return total;
 }
 
@@ -2140,17 +2148,66 @@ static void parse_range_field(struct connection* conn)
  */
 static int parse_request(struct connection* conn)
 {
-	size_t bound1, bound2;
+	static const char* const crnl = "\r\n";
+	int reqlen = conn->request_length;
+	char* bptr = conn->request;
+	//size_t bound1, bound2;
 	char* tmp, *sptr;
+	int chr = 0;
+	int i = 0;
 
 	assert(conn->request_length == strlen(conn->request));
 
+//printf( "Header %d '%s'\n", reqlen, conn->request );
+//fflush( stdout );
+
 	/* parse method */
-	for (bound1 = 0;
-	        (bound1 < conn->request_length) &&
-	        (conn->request[bound1] != ' ');
-	        bound1++)
+	for (sptr = bptr; i < reqlen && (*sptr) != ' '; sptr++, i++)
+		chr = (*sptr);
+
+	if (i >= reqlen) { return 0; } /* fail */
+
+	(*sptr) = '\0';
+	conn->method = bptr;
+	bptr = ++sptr;
+
+//printf( "METHOD '%s' '%s'\n", conn->method, bptr );
+//fflush( stdout );
+
+	for (sptr = conn->method; (*sptr); sptr++)
+		(*sptr) = (char)toupper( *sptr );
+
+	/* parse url */
+	sptr = strpbrk( bptr, "\r\n" );
+
+	if ( !sptr ) { return 0; } /* fail */
+
+	for (; (*sptr) != ' '; --sptr)
 		;
+
+#if 0
+	/* parse url */
+	for (sptr = bptr; i < reqlen && ((*sptr) != ' ' || chr == '\\'); sptr++, i++)
+		chr = (*sptr);
+
+	if (i >= reqlen) { return 0; } /* fail */
+#endif
+
+	(*sptr) = '\0';
+	conn->urllen = sptr - bptr;
+	conn->url = split_string( bptr, 0, conn->urllen );
+	bptr = ++sptr;
+
+//printf( "URL %d '%s' '%s'\n", conn->urllen, conn->url, bptr );
+//fflush( stdout );
+
+#if 0
+	for (bound1 = 0;
+			(bound1 < rlen) &&
+			(conn->request[bound1] != ' ');
+	        bound1++)
+	{
+	}
 
 	conn->method = split_string(conn->request, 0, bound1);
 	strntoupper(conn->method, bound1);
@@ -2204,10 +2261,19 @@ static int parse_request(struct connection* conn)
 
 	sptr = &(conn->request[bound2+1]);
 	for (; (*sptr) == '\n' || (*sptr) == '\r'; sptr++);
+	conn->header = ++sptr;
+#endif
+
+	conn->conn_close = 0;
+	for (; (*sptr) != '\n' && (*sptr) != '\r'; sptr++);
+	for (; (*sptr) == '\n' || (*sptr) == '\r'; sptr++);
 	conn->header = sptr;
 
+//printf( "Header '%s'\n", sptr );
+//fflush( stdout );
+
     conn->headers_total = parse_tuples(
-        conn, conn->headers, conn->header, ':', "\r\n", MAX_HEADERS
+        conn, conn->headers, conn->header, ':', crnl, MAX_HEADERS
     );
 
     if (conn->headers_total < 1)
@@ -2217,7 +2283,6 @@ static int parse_request(struct connection* conn)
 	tmp = hdrsearch( conn, "Connection" );
 
 	if (tmp != NULL) {
-
 		if (strcasecmp(tmp, "close") == 0) {
 			conn->conn_close = 1;
 		} else if (strcasecmp(tmp, "keep-alive") == 0) {
@@ -2653,7 +2718,8 @@ static void process_get(struct connection* conn)
 	const char* forward_to = NULL;
 	struct stat filestat;
 	int slash_path = 0;
-	int kbps, rc = 0;
+	float kbps = 0;
+	int rc = 0;
 	size_t i=0;
 
 	if (use_redirect && conn->host) {
@@ -2722,6 +2788,16 @@ static void process_get(struct connection* conn)
 
 			if (use_millisecs && (msecs = strchr( blksize, '/' ))) {
 				conn->reply_msecs = atoi( msecs+1 );
+
+				if (conn->reply_msecs < 10) {
+					fprintf(
+						logfile,
+						"Milliseconds value too small for '%s'\n",
+						mimetype
+					);
+					conn->reply_msecs = 100;
+				}
+
 				conn->reply_usecs = conn->reply_msecs * 1000;
 				conn->reply_msecs /= 1000;
 
@@ -2736,12 +2812,14 @@ static void process_get(struct connection* conn)
 
 			kbps = conn->reply_blksz * 8;
 
-			if ( use_millisecs ) { kbps /= conn->reply_msecs; }
+			if ( use_millisecs ) {
+				kbps /= conn->reply_msecs;
+			}
 
 			fprintf(
 				logfile,
-				"Throttling '%s' at %d Kbps [%d, %02f]\n",
-				mimetype, kbps, conn->reply_burst, conn->reply_msecs
+				"Throttling '%s' at %.2f Kbps [%d, %02f]\n",
+				mimetype, kbps/1000, conn->reply_burst, conn->reply_msecs
 			);
 
 			if (kbps < 4096) {
@@ -2750,7 +2828,6 @@ static void process_get(struct connection* conn)
 					"Throttle value too small for '%s' -- reset to %d Kbps\n",
 					mimetype, kbps
 				);
-				kbps = 4096;
 			}
 			fflush( logfile );
 		}
@@ -2936,10 +3013,12 @@ static void process_get(struct connection* conn)
 /* Process a POST request. */
 static void process_post(struct connection* conn)
 {
+	static const char* const delims = "&";
+
 	if (conn->content_len < MAX_POST_LENGTH) {
 
         conn->tuples_total = parse_tuples(
-            conn, conn->tuples, conn->body, '=', "&", MAX_TUPLES
+            conn, conn->tuples, conn->body, '=', delims, MAX_TUPLES
         );
 
         if (conn->tuples_total > 0) {
