@@ -1,0 +1,17 @@
+CC=gcc
+CFLAGS?=-O -g -fstack-protector-all -DENABLE_SERVER -DENABLE_SSL_S2N -I/usr/local/include -I/usr/local/include/openssl
+#SUNLIBS=`[ \`uname\` = "SunOS" ] && echo -lsocket -lnsl`
+LIBS=${SUNLIBS} -Wl,-rpath=/usr/local/lib:/usr/lib -ldl -lcrypt -lcrypto -lpthread
+
+all: dawnhttpd
+
+dawnhttpd: dawnhttpd.c cdecode.c
+	$(CC) $(CFLAGS) $(LIBS) dawnhttpd.c cdecode.c -o $@ /usr/local/lib/libs2n.a /usr/lib/libpthread_nonshared.a
+
+clean:
+	rm -f dawnhttpd core dawnhttpd.core
+
+install:
+	-cp dawnhttpd /usr/sbin
+
+.PHONY: all clean
