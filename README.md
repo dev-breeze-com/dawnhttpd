@@ -71,7 +71,7 @@ BUGS
    Strange bug in the tuple_cmp function.  
    Debug to see if it occurs on your computer, where the  const parameter o2 gets reset to NULL.  
    Bug reports, patches and suggestions are much appreciated.  
-   See GitHub repository [Dawnhttp v1.5] (https://www.github.com/dev-breeze-com/dawnhttpd)  
+   See GitHub repository: https://www.github.com/dev-breeze-com/dawnhttpd  
 
 
 FUN FACTS
@@ -114,21 +114,21 @@ AUTHORS
 REPOSITORY
 ==========
 
-	*Dawnhttp github.io* -- https://dev-breeze-com.github.io/dawnhttpd  
-	*Dawnhttp v1.5* -- https://www.github.com/dev-breeze-com/dawnhttpd  
+   Dawnhttp github.io: https://dev-breeze-com.github.io/dawnhttpd  
+   Dawnhttp v1.5: https://www.github.com/dev-breeze-com/dawnhttpd  
 
 
 DONATION
 ========
 
-	<div>
-	<script src="https://liberapay.com/breezeos/widgets/button.js"></script><noscript><a href="https://liberapay.com/breezeos/donate"><img alt="Donate using Liberapay" src="https://liberapay.com/assets/widgets/donate.svg"></a></noscript>
-	</div>
+   <div>
+   <script src="https://liberapay.com/breezeos/widgets/button.js"></script><noscript><a href="https://liberapay.com/breezeos/donate"><img alt="Donate using Liberapay" src="https://liberapay.com/assets/widgets/donate.svg"></a></noscript>
+   </div>
 
 
 COMMERCIAL
 ==========
 
-	A commercial optimized version will soon be on our sales portal at:  
-	*Glyph.cloud* -- https://glyph.cloud
+   A commercial optimized version will soon be on our sales portal at:  
+   Glyph.cloud: https://glyph.cloud
 
