@@ -371,7 +371,7 @@ static size_t longest_ext = 0;
 /* If a connection is idle for idletime seconds or more, it gets closed and
  * removed from the connlist.  Set to 0 to remove the timeout functionality.
  */
-static int idletime = 15;
+static int idletime = 30;
 static struct timeval timeout;
 static char* keep_alive_field = NULL;
 
@@ -1040,6 +1040,7 @@ static char* tuple_search(struct data_tuple* tuples[], int total, const char* ar
 static void* ssl_config_search(struct connection* conn)
 //-----------------------------------------------------------------------------
 {
+#ifdef ENABLE_SSL
 	if ( !num_ssl_servers || !conn->fqdn )
 		return ssl_configs[0]->datum;
 
@@ -1054,6 +1055,7 @@ static void* ssl_config_search(struct connection* conn)
 		return ssl_configs[0]->datum;
 
 	return (*found)->datum;
+#endif
 }
 
 //-----------------------------------------------------------------------------
@@ -4819,12 +4821,12 @@ static void parse_commandline(const int argc, char* argv[])
 #endif
 	}
 
-	value = inisearch( "Connection/max-requests", "128" );
+	value = inisearch( "Connection/max-requests", "256" );
 	max_connections = (int)xstr_to_num(value);
 
 	value = inisearch( "Connection/timeout", "15" );
 	idletime = (int)xstr_to_num(value);
-	idletime = idletime > 15 ? 15 : idletime;
+	idletime = idletime > 60 ? 60 : idletime;
 	idletime = idletime < 15 ? 15 : idletime;
 
 	want_ssl = ini_evaluate( "SSL/enabled", "yes", NULL );
