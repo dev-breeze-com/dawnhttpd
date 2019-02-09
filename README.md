@@ -121,14 +121,16 @@ REPOSITORY
 DONATION
 ========
 
+{::nomarkdown}
    <div>
    <script src="https://liberapay.com/breezeos/widgets/button.js"></script><noscript><a href="https://liberapay.com/breezeos/donate"><img alt="Donate using Liberapay" src="https://liberapay.com/assets/widgets/donate.svg"></a></noscript>
    </div>
+{:/}
 
 
 COMMERCIAL
 ==========
 
    A commercial optimized version will soon be on our sales portal at:  
-   Glyph.cloud: https://glyph.cloud
+   Glyph.cloud: http://glyph.cloud
 
