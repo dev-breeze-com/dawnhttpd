@@ -71,14 +71,14 @@ BUGS
    Strange bug in the tuple_cmp function.  
    Debug to see if it occurs on your computer, where the  const parameter o2 gets reset to NULL.  
    Bug reports, patches and suggestions are much appreciated.  
-   See GitHub repository [Dawnhttp v1.5](https://www.github.com/dev-breeze-com/dawnhttpd)  
+   See GitHub repository [Dawnhttp v1.5] (https://www.github.com/dev-breeze-com/dawnhttpd)  
 
 
 FUN FACTS
 =========
 
    On an AMD Athlon64 X2 (Mem 1G) running Linux 3.10.104-amd64, we get  
-   weighttp -n 100000 -c 375 -k -H 'User-Agent: Weighttp' http://127.0.0.1:80  
+   weighttp -n 100000 -c 375 -k -H 'User-Agent: Weighttp' 127.0.0.1:80  
    weighttp - a lightweight and simple webserver benchmarking tool  
    starting benchmark...  
    spawning thread #1: 375 concurrent requests, 100000 total requests  
@@ -90,7 +90,7 @@ FUN FACTS
    status codes: 100000 2xx, 0 3xx, 0 4xx, 0 5xx  
    traffic: 889800000 bytes total, 22000000 bytes http, 867800000 bytes data  
 
-   weighttp -n 1000000 -c 500 -t 2 -k http://127.0.0.1/index-1024.html  
+   weighttp -n 1000000 -c 500 -t 2 -k 127.0.0.1/index-1024.html  
    weighttp - a lightweight and simple webserver benchmarking tool  
    starting benchmark...  
    spawning thread #1: 250 concurrent requests, 500000 total requests  
@@ -111,6 +111,13 @@ AUTHORS
    The Breeze::OS website: http://www.breezeos.com
 
 
+REPOSITORY
+==========
+
+	*Dawnhttp github.io* -- https://dev-breeze-com.github.io/dawnhttpd  
+	*Dawnhttp v1.5* -- https://www.github.com/dev-breeze-com/dawnhttpd  
+
+
 DONATION
 ========
 
@@ -123,12 +130,5 @@ COMMERCIAL
 ==========
 
 	A commercial optimized version will soon be on our sales portal at:  
-	[Glyph.cloud](https://glyph.cloud)
-
-
-REPOSITORY
-==========
-
-	[Dawnhttp github.io](https://dev-breeze-com.github.io/dawnhttpd)
-	[Dawnhttp v1.5](https://www.github.com/dev-breeze-com/dawnhttpd)
+	*Glyph.cloud* -- https://glyph.cloud
 
