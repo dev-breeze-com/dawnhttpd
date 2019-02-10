@@ -32,10 +32,12 @@ static const char copyright[] = "copyright (c) 2017 Tsert inc.";
 
 #ifndef DEBUG
 #define NDEBUG
-#define DBG( s1, args...);
+#define DBG( s1, args...)
+#define DBG_FLUSH()
 static const int debug = 0;
 #else
-#define DBG( s1, args...)   fprintf( logfile, s1, ## args, NULL) ;
+#define DBG( s1, args...)   fprintf( logfile, s1, ## args, NULL)
+#define DBG_FLUSH()     fflush( logfile)
 static const int debug = 1;
 #endif
 
@@ -168,17 +170,17 @@ CTASSERT(sizeof(unsigned long long) >= sizeof(off_t));
  * Under a BSD license.
  */
 #undef LIST_HEAD
-#define LIST_HEAD(name, type)											\
-struct name {															\
-		struct type *lh_first;  /* first element */					 \
+#define LIST_HEAD(name, type)	\
+struct name {		\
+		struct type *lh_first;  /* first element */	\
 }
 
 #undef LIST_HEAD_INITIALIZER
 #define LIST_HEAD_INITIALIZER(head)		{NULL}
 
 #undef LIST_ENTRY
-#define LIST_ENTRY(type)												\
-struct {																\
+#define LIST_ENTRY(type)	\
+struct {					\
 		struct type *le_next;	/* next element */					  \
 		struct type **le_prev;  /* address of previous next element */  \
 }
@@ -187,28 +189,28 @@ struct {																\
 #define LIST_FIRST(head)		((head)->lh_first)
 
 #undef LIST_FOREACH_SAFE
-#define LIST_FOREACH_SAFE(var, head, field, tvar)						\
-	for ((var) = LIST_FIRST((head));									\
-		(var) && ((tvar) = LIST_NEXT((var), field), 1);				 \
+#define LIST_FOREACH_SAFE(var, head, field, tvar)		\
+	for ((var) = LIST_FIRST((head));					\
+		(var) && ((tvar) = LIST_NEXT((var), field), 1);	\
 		(var) = (tvar))
 
 #undef LIST_INSERT_HEAD
 #define LIST_INSERT_HEAD(head, elm, field) do {						 \
 		if ((LIST_NEXT((elm), field) = LIST_FIRST((head))) != NULL)	 \
 				LIST_FIRST((head))->field.le_prev = &LIST_NEXT((elm), field);\
-		LIST_FIRST((head)) = (elm);									 \
-		(elm)->field.le_prev = &LIST_FIRST((head));					 \
+		LIST_FIRST((head)) = (elm);						\
+		(elm)->field.le_prev = &LIST_FIRST((head));		\
 } while (0)
 
 #undef LIST_NEXT
 #define LIST_NEXT(elm, field)	((elm)->field.le_next)
 
 #undef LIST_REMOVE
-#define LIST_REMOVE(elm, field) do {									\
-		if (LIST_NEXT((elm), field) != NULL)							\
-				LIST_NEXT((elm), field)->field.le_prev =				\
-					(elm)->field.le_prev;								\
-		*(elm)->field.le_prev = LIST_NEXT((elm), field);				\
+#define LIST_REMOVE(elm, field) do {					\
+		if (LIST_NEXT((elm), field) != NULL)			\
+				LIST_NEXT((elm), field)->field.le_prev =\
+					(elm)->field.le_prev;				\
+		*(elm)->field.le_prev = LIST_NEXT((elm), field);\
 } while (0)
 /* [<-] */
 
@@ -1098,7 +1100,6 @@ static int connect_sockin(const char* host, const char* port)
 //-----------------------------------------------------------------------------
 {
 	struct addrinfo hints, *res;
-	int sockopt = 1;
 	int fd = (-1);
 	int rc = 0;
 
@@ -1130,8 +1131,7 @@ static int connect_sockin(const char* host, const char* port)
 		return (-1);
 	}
 
-	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &sockopt, sizeof(sockopt)) == -1)
-		warn("setsockopt(TCP_NODELAY)");
+	nonblock_socket(fd);
 
 	return fd;
 }
@@ -1182,6 +1182,7 @@ static int init_sockin(int lasttry, int bindport, int ssl_on)
 #if DISABLE_NAGLE
 	/* disable Nagle since we buffer everything ourselves */
 	sockopt = 1;
+
 	if (setsockopt(sockin, IPPROTO_TCP, TCP_NODELAY, &sockopt, sizeof(sockopt)) == -1)
 		err(1, "setsockopt(TCP_NODELAY)");
 #endif
@@ -1359,16 +1360,18 @@ static void free_conn_malloc(struct connection* conn)
 
 #ifdef ENABLE_PROXY
 	if (conn->passthru > 0) {
+		struct data_bucket *bucket = conn->buckets.head;
+
 		//xclose(conn->passthru);
 		shutdown(conn->passthru, SHUT_RDWR);
 		conn->passthru = -1;
-
-		struct data_bucket *bucket = conn->buckets.head;
 
 		for (; bucket; bucket = bucket->next) {
 			free(bucket->value);
 			free(bucket);
 		}
+
+        conn->buckets.head = NULL;
 	}
 #endif
 
@@ -1393,6 +1396,7 @@ static void recycle_connection(struct connection* conn)
 
 	log_connection( conn, 1 );
 
+	/* don't reset conn->client */
 	conn->socket = -1;
 	conn->passthru = -1;
 
@@ -1401,7 +1405,6 @@ static void recycle_connection(struct connection* conn)
 	conn->socket = socket_tmp;
 	conn->passthru = proxy_tmp;
 
-	/* don't reset conn->client */
 	conn->request = NULL;
 	conn->request_length = 0;
 
@@ -1695,11 +1698,8 @@ static int ssl_handshake(struct connection* conn)
 		}
 	}
 
-	if (blocked == S2N_NOT_BLOCKED) {
-		conn->state = RECV_REQUEST;
-		poll_recv_request(conn);
+	if (blocked == S2N_NOT_BLOCKED)
 		return 1;
-	}
 
 	return -1;
 }
@@ -1737,8 +1737,8 @@ static int ssl_send(struct connection* conn, char *buf, ssize_t sent)
 				return (-1);
 
 			case (-1):
-				conn->state = DONE;
-				warn("ssl_send s2n_connection_get_alert %s", tls_error(conn->ssl));
+				conn->state = SSL_DONE;
+				warn("ssl_send connection_get_alert %s", tls_error(conn->ssl));
 				return -1;
 			default:
 			break;
@@ -1764,8 +1764,8 @@ static int ssl_recv(struct connection* conn, char *buf, ssize_t recvd)
 				return (-1);
 
 			case (-1):
-				conn->state = DONE;
-				warn("ssl_recv s2n_connection_get_alert %s", tls_error(conn->ssl));
+				conn->state = SSL_DONE;
+				warn("ssl_recv connection_get_alert %s", tls_error(conn->ssl));
 				return -1;
 			default:
 			break;
@@ -1781,10 +1781,8 @@ static int ssl_shutdown(struct connection* conn)
 {
 	errno = 0;
 
- // warn("ssl_shutdown tls_shutdown");
-
 	if (tls_close(conn->ssl) < 0) {
-		warn("ssl_shutdown: s2n_connection_get_alert %s", tls_error(conn->ssl));
+		warn("ssl_shutdown: connection_get_alert %s", tls_error(conn->ssl));
 		return -1;
 	}
 
@@ -1798,8 +1796,6 @@ static int ssl_handshake(struct connection* conn)
 {
 	errno = 0;
 
-//	warn("ssl_handshake tls_negotiate");
-
 	switch (tls_handshake(conn->ssl)) {
 		case TLS_WANT_POLLIN:
 		case TLS_WANT_POLLOUT:
@@ -1807,15 +1803,13 @@ static int ssl_handshake(struct connection* conn)
 			return (-1);
 
 		case (-1):
-			conn->state = DONE;
-			warn("ssl_handshake s2n_connection_get_alert %s", tls_error(conn->ssl));
+			warn("ssl_handshake connection_get_alert %s",tls_error(conn->ssl));
+            conn->state = SSL_DONE;
 			return -1;
 		default:
 		break;
 	}
 
-	conn->state = RECV_REQUEST;
-	poll_recv_request(conn);
 	return 1;
 }
 #endif
@@ -1846,7 +1840,7 @@ static void accept_connection(int ssl_on)
 		/* allocate and initialise struct connection */
 		conn = new_connection();
 	} else {
-		conn = LIST_FIRST(&freeconnlist);									\
+		conn = LIST_FIRST(&freeconnlist);
 		LIST_REMOVE(conn, entries);
 		num_freeconnections -= 1;
 		//recycle_connection(conn);
@@ -3492,7 +3486,6 @@ static void process_get(struct connection* conn)
 			rfc1123_date(date, now), server_hdr, keep_alive(conn));
 
 		if (conn->reply_type == REPLY_CACHED) {
-			if (conn->reply != NULL) { free(conn->reply); }
 			fprintf( logfile, "ASSSERT REPLY_CACHED\n" );
 			conn->reply = NULL;
 		}
@@ -4258,12 +4251,12 @@ static void httpd_poll(void)
 //-----------------------------------------------------------------------------
 {
 	fd_set recv_set, send_set;
+	struct connection *conn;
+	struct connection *next;
 	int bother_with_timeout = 0;
 	int retcode, max_fd=0;
 	int nb_buckets = 0;
 	int64_t delay = 0;
-	struct connection *conn;
-	struct connection *next;
 	time_t elapsed;
 
 	timeout.tv_sec = idletime;
@@ -4276,7 +4269,7 @@ static void httpd_poll(void)
 #define MAX_FD_SET(sock, fdset) \
 	{\
 		FD_SET(sock,fdset);\
-		max_fd = (max_fd<sock) ? sock : max_fd;\
+		max_fd = (sock>max_fd) ? sock : max_fd;\
 	}
 
 	MAX_FD_SET(sockin, &recv_set);
@@ -4306,9 +4299,12 @@ static void httpd_poll(void)
 			bother_with_timeout = 1;
 
 			if (ssl_handshake(conn) > 0) {
+                conn->state = RECV_REQUEST;
+                poll_recv_request(conn);
 				MAX_FD_SET(conn->socket, &recv_set);
+            } else if (conn->state == SSL_DONE) {
+			    ssl_shutdown(conn);
 			} else {
-				DBG("httpd_poll TV_SEC %d STATE=%d\n", conn->socket, conn->state);
 				timeout.tv_sec = 0;
 				timeout.tv_usec = 100000;
 			}
@@ -4337,27 +4333,22 @@ static void httpd_poll(void)
 		case RECV_REQUEST:
 			bother_with_timeout = 1;
 			MAX_FD_SET(conn->socket, &recv_set);
-#ifdef _ENABLE_SSL
+#if 0
 			if ( conn->ssl ) {
 				//delay = s2n_connection_get_delay(conn->ssl) / 1000;
-				timeout.tv_sec = 0;
-				timeout.tv_usec = 100000;
-				//timeout.tv_usec = delay > 0 ? delay : 100000;
 			}
 #endif
 			break;
 
-		case SEND_HEADER:
 		case SEND_REPLY:
+			nb_buckets = 1;
+
+		case SEND_HEADER:
 			bother_with_timeout = 1;
 			MAX_FD_SET(conn->socket, &send_set);
-
-#ifdef _ENABLE_SSL
+#if 0
 			if ( conn->ssl ) {
 				//delay = s2n_connection_get_delay(conn->ssl) / 1000;
-				timeout.tv_sec = 0;
-				timeout.tv_usec = 100000;
-				//timeout.tv_usec = delay > 0 ? delay : 100000;
 			}
 #endif
 			break;
@@ -4369,7 +4360,8 @@ static void httpd_poll(void)
 		}
 	}
 
-	if (num_connections > 0 || nb_buckets > 0) {
+	//if (num_connections > 0 || nb_buckets > 0) {
+	if (nb_buckets > 0) {
 		bother_with_timeout = 1;
 		timeout.tv_sec = nb_buckets > 0 ? 0 : 1;
 		timeout.tv_usec = nb_buckets > 0 ? 100000 : 0;
@@ -4383,23 +4375,30 @@ static void httpd_poll(void)
 
 	errno = 0;
 
+	DBG("SELECT() CONN#%d MAX-FD=%d BUCKETS=%d WAIT=[%ld,%ld]\n",
+		num_connections, max_fd, nb_buckets, timeout.tv_sec, timeout.tv_usec);
+
+	DBG_FLUSH();
+
 	retcode = select(max_fd + 1, &recv_set, &send_set, NULL,
 		(bother_with_timeout) ? &timeout : NULL);
 
-	DBG("SELECT() CONN#%d WAIT=[%ld,%ld]\n",
-		num_connections, timeout.tv_sec, timeout.tv_usec);
+	DBG("SELECT() RC=%d CONN#%d MAX-FD=%d BUCKETS=%d WAIT=[%ld,%ld]\n",
+		retcode, num_connections, max_fd, nb_buckets, timeout.tv_sec, timeout.tv_usec);
 
 	if ( !want_proxy || nb_buckets < 1) {
 
 		  if (retcode == 0) {
 				if (!bother_with_timeout) { err(1, "select() timed out"); }
 				DBG("httpd_poll RETCODE==0 EXITING -------------------------------------------\n");
+				DBG_FLUSH();
 				return;
 		  }
 
 		  if (retcode == -1) {
 				if (errno != EINTR) { err(1, "select() failed"); }
 				DBG("httpd_poll RETCODE==-1 EXITING -------------------------------------------\n");
+				DBG_FLUSH();
 				return; /* interrupted by signal */
 		  }
 	 }
@@ -4426,9 +4425,7 @@ static void httpd_poll(void)
 		switch (conn->state) {
 #ifdef ENABLE_SSL
 		case SSL_ACCEPT:
-			if (ssl_handshake(conn) > 0) {
-				MAX_FD_SET(conn->socket, &recv_set);
-			}
+			ssl_handshake(conn);
 			break;
 
 		case SSL_DONE:
@@ -4503,6 +4500,7 @@ static void httpd_poll(void)
 		}
 	}
 	DBG("httpd_poll EXITING -------------------------------------------\n");
+	DBG_FLUSH();
 #undef MAX_FD_SET
 }
 
@@ -4866,14 +4864,15 @@ static void parse_commandline(const int argc, char* argv[])
 		errx(1, "Invalid video burst size");
 
 #ifdef ENABLE_PASSWORD
-	use_password = ini_evaluate( "Password/enabled", "yes", NULL );
-	password_file = inisearch( "Password/filename", NULL );
+	if ((use_password = ini_evaluate( "Password/enabled", "yes", NULL ))) {
+        password_file = inisearch( "Password/filename", NULL );
 
-	if ((password_salt = inisearch( "Password/salt", NULL )))
-		password_saltlen = strlen( password_salt );
+        if ((password_salt = inisearch( "Password/salt", NULL )))
+            password_saltlen = strlen( password_salt );
 
-	if (use_password && !password_salt)
-		errx(1, "Password salt missing");
+        if (use_password && !password_salt)
+            errx(1, "Password salt missing");
+    }
 #endif
 
 	if ( want_drop ) {
@@ -5377,7 +5376,7 @@ int main(int argc, char** argv)
 	logfile = stdout;
 	errfile = stderr;
 
-	if (argv[1]) {
+	if (argc >= 2 && argv[1]) {
 		if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
 			usage(argv[0]);
 			exit(0);
