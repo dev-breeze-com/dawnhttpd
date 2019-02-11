@@ -29,7 +29,6 @@ static const char copyright[] = "copyright (c) 2017 Tsert inc.";
 #define ENABLE_PASSWORD
 #endif
 
-#define DEBUG
 #ifndef DEBUG
 #define NDEBUG
 #define DBG( s1, args...)
