@@ -37,7 +37,7 @@ static const char copyright[] = "copyright (c) 2017 Tsert inc.";
 static const int debug = 0;
 #else
 #define DBG( s1, args...)   fprintf( logfile, s1, ## args, NULL)
-#define DBG_FLUSH()     fflush( logfile)
+#define DBG_FLUSH()	 fflush( logfile)
 static const int debug = 1;
 #endif
 
@@ -251,8 +251,8 @@ typedef enum {
 	RECV_REQUEST=0, /* receiving request */
 	SEND_HEADER,	/* sending generated header */
 	SEND_REPLY,		/* sending reply */
-	FORWARD_REQUEST, /* forward request */
-	FORWARD_REPLY,	/* forward reply */
+	PROXY_REQUEST, /* forward request */
+	PROXY_REPLY,	/* forward reply */
 	SSL_ACCEPT,		/* ssl handshake */
 	SSL_DONE,		/* ssl shutdown */
 	DONE			/* connection closed, remove from queue */
@@ -510,9 +510,6 @@ static void poll_recv_request(struct connection*);
 static void poll_send_header(struct connection*);
 static void poll_send_reply(struct connection*);
 static void log_connection(struct connection*, int);
-
-//static void forward_request(struct connection*);
-//static void forward_reply(struct connection*);
 
 #if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__linux__)
 #include <err.h>
@@ -1246,15 +1243,15 @@ static void usage(const char* argv0)
 {
 	printf("Usage:\t%s [options]\n\n", argv0);
 	printf("  --no-log (override settings file)\n"
-			"    Outputs log info to stdout.\n"
-			"    Outputs warn/error info to stderr.\n\n");
+			"	Outputs log info to stdout.\n"
+			"	Outputs warn/error info to stderr.\n\n");
 	printf("  --config (override the default settings file)\n"
-			"    Use specified settings file.\n\n");
+			"	Use specified settings file.\n\n");
 	printf("  --no-daemon (override settings file)\n"
-			"    Do not detach from the controlling terminal to run in the background.\n\n");
+			"	Do not detach from the controlling terminal to run in the background.\n\n");
 #ifdef __FreeBSD__
 	printf("  --accf (default: don't use acceptfilter)\n"
-			"    Use acceptfilter.  Needs the accf_http module loaded.\n\n");
+			"	Use acceptfilter.  Needs the accf_http module loaded.\n\n");
 #endif
 #ifndef ENABLE_INET6
 	printf("  (This binary was built without IPv6 support)\n");
@@ -1364,7 +1361,7 @@ static void free_conn_malloc(struct connection* conn)
 			free(bucket);
 		}
 
-        conn->buckets.head = NULL;
+		conn->buckets.head = NULL;
 	}
 #endif
 
@@ -1692,9 +1689,9 @@ static int ssl_handshake(struct connection* conn)
 	}
 
 	if (blocked == S2N_NOT_BLOCKED) {
-        conn->state = RECV_REQUEST;
+		conn->state = RECV_REQUEST;
 		return 1;
-    }
+	}
 
 	return -1;
 }
@@ -1799,13 +1796,13 @@ static int ssl_handshake(struct connection* conn)
 
 		case (-1):
 			warn("ssl_handshake connection_get_alert %s",tls_error(conn->ssl));
-            conn->state = SSL_DONE;
+			conn->state = SSL_DONE;
 			return -1;
 		default:
 		break;
 	}
 
-    conn->state = RECV_REQUEST;
+	conn->state = RECV_REQUEST;
 	return 1;
 }
 #endif
@@ -3109,25 +3106,25 @@ static int init_guestbook()
 	char* value;
 
 	if ((value = inisearch( "Guestbook/path", NULL ))) {
-	    xasprintf(&path, "%s/guestbook/%s", baseroot, value );
+		xasprintf(&path, "%s/guestbook/%s", baseroot, value );
 		guestbook_file = fopen( path, "ab");
-        free(path);
-    }
+		free(path);
+	}
 
 	if (guestbook_file == NULL)
 		errx(1, "failed to open guestbook file");
 
 	if ((value = inisearch( "Guestbook/reply", NULL )))
-	    xasprintf(&guestbook_reply, "%s/guestbook/%s", baseroot, value );
+		xasprintf(&guestbook_reply, "%s/guestbook/%s", baseroot, value );
 
 	if (guestbook_reply == NULL)
 		errx(1, "failed to locate guestbook reply file");
 
 	if ((value = inisearch( "Guestbook/template", NULL ))) {
-	    xasprintf(&path, "%s/guestbook/%s", baseroot, value );
+		xasprintf(&path, "%s/guestbook/%s", baseroot, value );
 		if (load_file( value, &guestbook_template, (1 << 12)) < 1)
 			errx(1, "invalid guestbook template file --guestbook");
-        free(path);
+		free(path);
 	}
 
 	if (guestbook_template == NULL)
@@ -3282,13 +3279,12 @@ static void process_get(struct connection* conn)
 
 	if (want_redirect && conn->host && !conn->ssl) {
 		xasprintf(&redirect_key, "%s%s:80", "Redirect/", conn->host);
-		//fprintf( logfile, "load_file: %s\n", redirect_key );
 		forward_to = inisearch( redirect_key, NULL );
 		free(redirect_key);
 	}
 
 	if (forward_to) {
-		fprintf( logfile, "Redirect: '%s' '%s'\n", forward_to, decoded_url );
+		fprintf( logfile, "Redirecting to %s%s\n", forward_to, decoded_url );
 		redirect(conn, "%s%s", forward_to, decoded_url);
 		return;
 	}
@@ -3742,7 +3738,8 @@ static int forward_request(struct connection* conn)
 
 	int nwritten = send( conn->passthru, buf, nbytes, 0 );
 	if (nwritten >= nbytes) {
-		conn->state = FORWARD_REPLY;
+		DBG("PROXY_REQUEST SENT %d FD=%d\n", nwritten, conn->passthru);
+		conn->state = PROXY_REPLY;
 		return nwritten;
 	}
 
@@ -3754,6 +3751,7 @@ static int forward_request(struct connection* conn)
 		bucket->key = NULL;
 		bucket->next = NULL;
 
+		DBG("PROXY_REQUEST QUEUED %d FD=%d\n", nwritten, conn->passthru);
 		num_buckets++;
 
 		if (conn->buckets.head) {
@@ -3763,9 +3761,9 @@ static int forward_request(struct connection* conn)
 			conn->buckets.head = bucket;
 			conn->buckets.tail = bucket;
 		}
-		conn->state = FORWARD_REPLY;
 	}
 
+	conn->state = PROXY_REQUEST;
 	return nwritten;
 }
 
@@ -3776,9 +3774,7 @@ static void forward_queued_request(struct connection* conn)
 	//struct data_bucket *bucket = conn->buckets.tqh_first;
 	struct data_bucket *bucket = conn->buckets.head;
 
-	num_buckets--;
-
-	DBG("FORWARD_REQUEST BUCKET=%d FD=%d\n", (unsigned int) bucket, conn->passthru);
+	DBG("PROXY_QUEUED_REQUEST BUCKET=%d FD=%d\n", (unsigned int) bucket, conn->passthru);
 
 	if ( bucket ) {
 		size_t nbytes = bucket->size - bucket->written;
@@ -3789,15 +3785,17 @@ static void forward_queued_request(struct connection* conn)
 			bucket->written += written;
 		}
 
-		conn->buckets.head = bucket->next;
-
 		if (bucket->written >= bucket->size) {
-			DBG("FORWARD_REQUEST %d FD=%d\n", written, conn->passthru);
+			DBG("PROXY_QUEUED_REQUEST %d FD=%d\n", written, conn->passthru);
+			conn->state = PROXY_REPLY;
+			conn->buckets.head = bucket->next;
+
+			num_buckets--;
 			free(bucket->value);
 			free(bucket);
 		}
-
-		conn->state = FORWARD_REPLY;
+	} else {
+		conn->state = PROXY_REPLY;
 	}
 }
 
@@ -3812,7 +3810,7 @@ static void forward_reply(struct connection* conn)
 
 	errno = 0;
 	nbytes = recv(conn->passthru, buf, sizeof(buf), 0);
-	DBG("FORWARD_REPLY %d FD=%d\n", nbytes, conn->passthru);
+	DBG("PROXY_REPLY %d FD=%d\n", nbytes, conn->passthru);
 
 	if (nbytes > 0) {
 		ssize_t total = nbytes;
@@ -3834,7 +3832,7 @@ static void forward_reply(struct connection* conn)
 		  }
 	 } else if (nbytes == -1) {
 		if (errno != EAGAIN && errno != EINTR) {
-			DBG("FORWARD_REPLY CLOSE FD=%d\n", conn->passthru);
+			DBG("PROXY_REPLY CLOSE FD=%d\n", conn->passthru);
 			conn->state = DONE;
 		}
 	 } else {
@@ -3936,8 +3934,10 @@ static void poll_recv_request(struct connection* conn)
 
 			if (want_proxy && forward_host) {
 
+				num_requests++;
+
 				if (conn->passthru > 0) {
-					DBG("FORWARD CONNECT PASSTHRU ON FD %d\n", conn->passthru);
+					DBG("PROXY CONNECT PASSTHRU ON FD %d\n", conn->passthru);
 					if (forward_request(conn) < 0) {
 						default_reply(conn, 500, "Internal Server Error",
 							"Your request was dropped because of a server error.");
@@ -4294,10 +4294,19 @@ static void httpd_poll(void)
 			bother_with_timeout = 1;
 
 			if (ssl_handshake(conn) > 0) {
-                poll_recv_request(conn);
+				poll_recv_request(conn);
 				MAX_FD_SET(conn->socket, &recv_set);
-            } else if (conn->state == SSL_DONE) {
-			    ssl_shutdown(conn);
+
+#ifdef ENABLE_PROXY
+				if (conn->state == PROXY_REQUEST || conn->state == PROXY_REPLY) {
+					nb_buckets = 1;
+					bother_with_timeout = 1;
+					MAX_FD_SET(conn->passthru, &recv_set);
+				}
+#endif
+			} else if (conn->state == SSL_DONE) {
+				ssl_shutdown(conn);
+
 			} else {
 				timeout.tv_sec = 0;
 				timeout.tv_usec = 100000;
@@ -4315,8 +4324,8 @@ static void httpd_poll(void)
 #endif
 
 #ifdef ENABLE_PROXY
-		case FORWARD_REQUEST:
-		case FORWARD_REPLY:
+		case PROXY_REQUEST:
+		case PROXY_REPLY:
 			nb_buckets = 1;
 			bother_with_timeout = 1;
 			MAX_FD_SET(conn->passthru, &recv_set);
@@ -4354,8 +4363,7 @@ static void httpd_poll(void)
 		}
 	}
 
-	//if (num_connections > 0 || nb_buckets > 0) {
-	if (nb_buckets > 0) {
+	if (num_buckets > 0 || nb_buckets > 0) {
 		bother_with_timeout = 1;
 		timeout.tv_sec = nb_buckets > 0 ? 0 : 1;
 		timeout.tv_usec = nb_buckets > 0 ? 100000 : 0;
@@ -4419,7 +4427,8 @@ static void httpd_poll(void)
 		switch (conn->state) {
 #ifdef ENABLE_SSL
 		case SSL_ACCEPT:
-			ssl_handshake(conn);
+			if (ssl_handshake(conn) > 0)
+				poll_recv_request(conn);
 			break;
 
 		case SSL_DONE:
@@ -4428,11 +4437,11 @@ static void httpd_poll(void)
 #endif
 
 #ifdef ENABLE_PROXY
-		case FORWARD_REQUEST:
+		case PROXY_REQUEST:
 			forward_queued_request(conn);
 			break;
 
-		case FORWARD_REPLY:
+		case PROXY_REPLY:
 			if (FD_ISSET(conn->passthru, &recv_set))
 				forward_reply(conn);
 #endif
@@ -4868,14 +4877,14 @@ static void parse_commandline(const int argc, char* argv[])
 
 #ifdef ENABLE_PASSWORD
 	if ((use_password = ini_evaluate( "Password/enabled", "yes", NULL ))) {
-        password_file = inisearch( "Password/filename", NULL );
+		password_file = inisearch( "Password/filename", NULL );
 
-        if ((password_salt = inisearch( "Password/salt", NULL )))
-            password_saltlen = strlen( password_salt );
+		if ((password_salt = inisearch( "Password/salt", NULL )))
+			password_saltlen = strlen( password_salt );
 
-        if (use_password && !password_salt)
-            errx(1, "Password salt missing");
-    }
+		if (use_password && !password_salt)
+			errx(1, "Password salt missing");
+	}
 #endif
 
 	if ( want_drop ) {
@@ -5030,13 +5039,13 @@ static void init_logging()
 	fprintf( logfile, "Using baseroot '%s'\n", baseroot );
 	fprintf( logfile, "Using wwwroot '%s'\n", pubroot );
 
-    if ( want_drop ) {
-        fprintf( logfile, "Setting GID to %d\n", (int)drop_gid);
-        fprintf( logfile, "Setting UID to %d\n", (int)drop_uid);
+	if ( want_drop ) {
+		fprintf( logfile, "Setting GID to %d\n", (int)drop_gid);
+		fprintf( logfile, "Setting UID to %d\n", (int)drop_uid);
 
-        fprintf( errfile, "Setting GID to %d\n", (int)drop_gid);
-        fprintf( errfile, "Setting UID to %d\n", (int)drop_uid);
-    }
+		fprintf( errfile, "Setting GID to %d\n", (int)drop_gid);
+		fprintf( errfile, "Setting UID to %d\n", (int)drop_uid);
+	}
 
 	fprintf( logfile, "Started on %s\n", ctime(&now) );
 	fprintf( errfile, "Started on %s\n", ctime(&now) );
@@ -5477,9 +5486,9 @@ int main(int argc, char** argv)
 #endif
 
 	if (want_chroot || want_drop) {
-        if ( want_logging) {
-    		init_logging();
-        }
+		if ( want_logging) {
+			init_logging();
+		}
 	}
 
 #ifdef ENABLE_GUESTBOOK
