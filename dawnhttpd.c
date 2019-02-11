@@ -25,11 +25,11 @@ static const char pkgname[] = "dawnhttpd/1.5.0";
 static const char copyright[] = "copyright (c) 2017 Tsert inc.";
 
 #ifdef ENABLE_SERVER
-#define ENABLE_IPV6
-#define ENABLE_PASSWORD
 #define ENABLE_PROXY
+#define ENABLE_PASSWORD
 #endif
 
+#define DEBUG
 #ifndef DEBUG
 #define NDEBUG
 #define DBG( s1, args...)
@@ -370,9 +370,6 @@ static int staticcache_total = 0;
 
 static size_t longest_ext = 0;
 
-/* If a connection is idle for idletime seconds or more, it gets closed and
- * removed from the connlist.  Set to 0 to remove the timeout functionality.
- */
 static int idletime = 30;
 static struct timeval timeout;
 static char* keep_alive_field = NULL;
@@ -399,6 +396,10 @@ static char* guestbook_template = NULL;
 static FILE* guestbook_file = NULL;
 #endif
 
+static char* pidfile_name = NULL;
+static FILE* logfile = NULL;
+static FILE* errfile = NULL;
+
 static int sockin = -1;	/* socket to accept connections */
 static int sockin_ssl = -1;	/* socket to accept SSL connections */
 
@@ -409,12 +410,6 @@ static char* pubroot = NULL;
 
 static char* server_hdr = NULL;
 static char* index_name = NULL;
-
-static char* pidfile_name = NULL;
-static char* logfile_name = NULL;
-static FILE* logfile = NULL;
-static char* errfile_name = NULL;
-static FILE* errfile = NULL;
 
 static int want_ssl = 0;
 static int want_cache = 0;
@@ -432,7 +427,6 @@ static int want_throttling_in_msecs = 0;
 
 static int want_accf = 0;
 static int want_daemon = 0;
-//static int want_keepalive = 1;
 static int want_server_id = 1;
 
 static int want_listing = 0;
@@ -521,8 +515,8 @@ static void log_connection(struct connection*, int);
 //static void forward_reply(struct connection*);
 
 #if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__linux__)
-# include <err.h>
-# include <stdarg.h>
+#include <err.h>
+#include <stdarg.h>
 #else
 /* err - prints "error: format: strerror(errno)" to stderr and exit()s with
  * the given code.
@@ -1254,8 +1248,8 @@ static void usage(const char* argv0)
 	printf("  --no-log (override settings file)\n"
 			"    Outputs log info to stdout.\n"
 			"    Outputs warn/error info to stderr.\n\n");
-	printf("  --no-drop (override settings file)\n"
-			"    Do not drop privileges.\n\n");
+	printf("  --config (override the default settings file)\n"
+			"    Use specified settings file.\n\n");
 	printf("  --no-daemon (override settings file)\n"
 			"    Do not detach from the controlling terminal to run in the background.\n\n");
 #ifdef __FreeBSD__
@@ -1327,7 +1321,6 @@ static void free_tuples(struct data_tuple *tuples[])
 	}
 }
 
-/* Log a connection, then cleanly deallocate its internals. */
 /* Log a connection, then cleanly deallocate its internals. */
 //-----------------------------------------------------------------------------
 static void free_conn_tuples(struct connection* conn)
@@ -1698,8 +1691,10 @@ static int ssl_handshake(struct connection* conn)
 		}
 	}
 
-	if (blocked == S2N_NOT_BLOCKED)
+	if (blocked == S2N_NOT_BLOCKED) {
+        conn->state = RECV_REQUEST;
 		return 1;
+    }
 
 	return -1;
 }
@@ -1810,6 +1805,7 @@ static int ssl_handshake(struct connection* conn)
 		break;
 	}
 
+    conn->state = RECV_REQUEST;
 	return 1;
 }
 #endif
@@ -1837,7 +1833,6 @@ static void accept_connection(int ssl_on)
 	errno = 0;
 
 	if (num_freeconnections < 1) {
-		/* allocate and initialise struct connection */
 		conn = new_connection();
 	} else {
 		conn = LIST_FIRST(&freeconnlist);
@@ -2011,7 +2006,7 @@ static void poll_check_timeout(struct connection* conn)
 {
 	time_t elapsed = now - conn->lasttime;
 
-	DBG("%s: FD=%d) %d now=%d elapsed=%d\n", __func__, conn->socket, conn->lasttime, now, elapsed);
+	DBG("%s: FD=%d) %ld now=%ld elapsed=%ld\n", __func__, conn->socket, conn->lasttime, now, elapsed);
 
 	if (elapsed >= idletime) {
 		fprintf( logfile, "%s: SOCKET=%d caused closure\n", __func__, conn->socket);
@@ -3335,11 +3330,11 @@ static void process_get(struct connection* conn)
 			free(target);
 			return;
 		}
-	} else if (strstr( decoded_url, ".acme.sh/" )) {
+/*	} else if (strstr( decoded_url, ".acme.sh/" )) {
 		rootdirlen = baserootlen;
-		/* points to a file */
 		xasprintf(&target, "%s%s", baseroot, decoded_url);
 		mimetype = url_content_type( decoded_url, conn->decoded_urllen, &conn->suffix );
+*/
 
 	} else {
 		/* points to a file */
@@ -3783,7 +3778,7 @@ static void forward_queued_request(struct connection* conn)
 
 	num_buckets--;
 
-	DBG("FORWARD_REQUEST BUCKET=%x FD=%d\n", bucket, conn->passthru);
+	DBG("FORWARD_REQUEST BUCKET=%d FD=%d\n", (unsigned int) bucket, conn->passthru);
 
 	if ( bucket ) {
 		size_t nbytes = bucket->size - bucket->written;
@@ -4234,7 +4229,7 @@ static void poll_send_reply(struct connection* conn)
 	conn->total_sent += (size_t)sent;
 	total_out += (size_t)sent;
 
-	DBG("poll_send_reply SENT=%d %d\n",sent,conn->total_sent);
+	DBG("poll_send_reply SENT=%d %lld\n", sent, conn->total_sent);
 
 	/* check if we're done sending */
 	if (conn->reply_sent == conn->reply_length) {
@@ -4299,7 +4294,6 @@ static void httpd_poll(void)
 			bother_with_timeout = 1;
 
 			if (ssl_handshake(conn) > 0) {
-                conn->state = RECV_REQUEST;
                 poll_recv_request(conn);
 				MAX_FD_SET(conn->socket, &recv_set);
             } else if (conn->state == SSL_DONE) {
@@ -4594,8 +4588,9 @@ static int pidfile_fd = -1;
 static void pidfile_remove(void)
 //-----------------------------------------------------------------------------
 {
-	if (unlink(pidfile_name) == -1)
-	{ err(1, "unlink(pidfile) failed"); }
+	if (unlink(pidfile_name) == -1) {
+		err(1, "unlink(pidfile) failed");
+	}
 
 	/* if (flock(pidfile_fd, LOCK_UN) == -1)
 			err(1, "unlock(pidfile) failed"); */
@@ -4608,17 +4603,18 @@ static int pidfile_read(void)
 //-----------------------------------------------------------------------------
 {
 	char buf[16];
-	int fd, i;
 	long long pid;
+	int fd, i;
+
 	fd = open(pidfile_name, O_RDONLY);
 
 	if (fd == -1)
-	{ err(1, " after create failed"); }
+		err(1, "Failed to open PID file");
 
 	i = (int)read(fd, buf, sizeof(buf) - 1);
 
 	if (i == -1)
-	{ err(1, "read from pidfile failed"); }
+		err(1, "Failed to read from PID file");
 
 	xclose(fd);
 
@@ -4752,23 +4748,23 @@ static void parse_commandline(const int argc, char* argv[])
 
 	for (i = optidx; i < argc; i++) {
 
-		if (strcmp(argv[i], "--no-log") == 0) {
-			want_logging = 0;
-			no_daemon = 1;
-			errfile = stderr;
-			errfile_name = NULL;
-			logfile = stdout;
-			logfile_name = NULL;
-		} else if (strcmp(argv[i], "--no-drop") == 0) {
-			want_drop = 0;
-		} else if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "--config")) {
+		if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "--config")) {
 			if ((cfgfile = argv[++i]) == NULL) { 
 				errx(1, "Invalid settings file" );
 			}
+		} else if (strcmp(argv[i], "--no-log") == 0) {
+			no_daemon = 1;
+			want_logging = 0;
+			errfile = stderr;
+			logfile = stdout;
+
 		} else if (strcmp(argv[i], "--no-daemon") == 0) {
+			no_daemon = 1;
 			want_daemon = 0;
+
 		} else if (strcmp(argv[i], "--accf") == 0) {
 			want_accf = 1;
+
 		} else {
 			errx(1, "unknown argument `%s'", argv[i]);
 		}
@@ -4790,13 +4786,22 @@ static void parse_commandline(const int argc, char* argv[])
 	pubrootlen = check_folder( pubroot );
 
 #ifdef ENABLE_SLOCATE
-	locate_dbpath = inisearch( "Locate/path", NULL );
-	locate_maxhits = inisearch( "Locate/maximum", NULL );
+	if ((want_slocate = ini_evaluate( "Locate/enabled", "yes", NULL ))) {
 
-	if ( locate_maxhits ) {
-		int max = atoi(locate_maxhits);
-		if (max < 25 || max > 2500) {
-			errx(1, "Invalid locate search maximum");
+		locate_maxhits = inisearch( "Locate/maxhits", "1000" );
+
+		if ((value = inisearch( "Locate/path", NULL )))
+			locate_dbpath = xstrdup( value );
+
+		if ( locate_maxhits ) {
+			int max = atoi(locate_maxhits);
+			if (max < 25 || max > 2500) {
+				errx(1, "Invalid maxhits (must be >25 and <2500");
+			}
+		}
+
+		if ( !locate_dbpath ) {
+			errx(1, "No valid Gnu locate database specified!");
 		}
 	}
 #endif
@@ -4838,9 +4843,7 @@ static void parse_commandline(const int argc, char* argv[])
 	}
 
 	want_server_id = ini_evaluate( "General/server-id", "yes", NULL );
-
 	want_listing = ini_evaluate( "Directory/index", "yes", NULL );
-	want_slocate = ini_evaluate( "Directory/locate", "yes", NULL );
 
 	value = inisearch( "Directory/index-name", "index.html" );
 	index_name = xstrdup(value);
@@ -4916,15 +4919,11 @@ static void drop_privileges()
 
 		if (setgid(drop_gid) == -1)
 		{ err(1, "setgid(%d)", (int)drop_gid); }
-
-		fprintf( logfile, "set gid to %d\n", (int)drop_gid);
 	}
 
 	if (drop_uid != INVALID_UID) {
 		if (setuid(drop_uid) == -1)
 		{ err(1, "setuid(%d)", (int)drop_uid); }
-
-		fprintf( logfile, "set uid to %d\n", (int)drop_uid);
 	}
 }
 
@@ -4933,22 +4932,15 @@ static void init_pidfile()
 //-----------------------------------------------------------------------------
 {
 #ifdef ENABLE_PIDFILE
-	char *value;
+	if (ini_evaluate( "pidfile", "yes", NULL )) {
 
-	if ((value = inisearch( "Pidfile/path", NULL )))
-		pidfile_name = xstrdup(value);
-
-	if ( !pidfile_name) {
 		if (want_chroot) {
-			xasprintf( &pidfile_name, "%s", "/run/dawnhttpd.pid");
+			xasprintf( &pidfile_name, "%s/run/dawnhttpd.pid", baseroot);
 		} else {
-			xasprintf( &pidfile_name, "%s", "/var/run/dawnhttpd.pid");
+			pidfile_name = xstrdup( "/var/run/dawnhttpd.pid" );
 		}
-	}
 
-	if (pidfile_name) {
 		pidfile_create();
-	}
 #endif
 }
 
@@ -4968,57 +4960,89 @@ static void remove_pidfile()
 static void stop_logging()
 //-----------------------------------------------------------------------------
 {
-	if (logfile != NULL) {
+	if (logfile != NULL && logfile != stdin) {
 		fflush(logfile);
 		fclose(logfile);
+		logfile = NULL;
 	}
 
-	if (errfile != NULL) {
+	if (errfile != NULL && errfile != stdin) {
 		fflush(errfile);
 		fclose(errfile);
+		errfile = NULL;
 	}
 }
+
+#ifdef ENABLE_SLOCATE
+//-----------------------------------------------------------------------------
+static void init_locate()
+//-----------------------------------------------------------------------------
+{
+	struct stat buf;
+	char *value;
+
+	if (want_chroot) {
+		xasprintf( &value, "%s%s", baseroot, locate_dbpath);
+		free(locate_dbpath); locate_dbpath = value;
+	}
+
+	if (stat( locate_dbpath, &buf ) < 0) {
+		errx(1, "No such file (%s) -- %s", locate_dbpath, strerror(errno));
+	}
+}
+#endif
 
 //-----------------------------------------------------------------------------
 static void init_logging()
 //-----------------------------------------------------------------------------
 {
+	char* logfile_name = NULL;
+	char* errfile_name = NULL;
 	char *value;
 
 	stop_logging();
 
 	if (want_chroot) {
-		xasprintf( &errfile_name, "/log/dawnhttpd/errors.log");
-		xasprintf( &logfile_name, "/log/dawnhttpd/access.log");
+		xasprintf( &logfile_name, "%s/log/dawnhttpd/access.log", baseroot);
+		xasprintf( &errfile_name, "%s/log/dawnhttpd/errors.log", baseroot);
 	} else {
-		value = inisearch( "General/logfile", "/var/log/dawnhttpd/access.log" );
-		logfile_name = xstrdup(value);
-
-		value = inisearch( "General/errfile", "/var/log/dawnhttpd/errors.log" );
-		errfile_name = xstrdup(value);
+		logfile_name = xstrdup( "/var/log/dawnhttpd/access.log" );
+		errfile_name = xstrdup( "/var/log/dawnhttpd/errors.log" );
 	}
 
-	if (logfile_name != NULL) {
-		logfile = fopen( logfile_name, "ab+" );
-		if (logfile == NULL) {
-			errx(1, "failed to open log file (\"%s\") %s", logfile_name, strerror(errno));
-		}
+	logfile = fopen( logfile_name, "ab+" );
+
+	if (logfile == NULL) {
+		errx(1, "No such file (%s) -- %s", logfile_name, strerror(errno));
 	}
 
 	fprintf( logfile, "\n%s, %s.\n", pkgname, copyright );
-	fprintf( logfile, "Using WWWROOT '%s'\n", baseroot );
-	fprintf( logfile, "Started on %s\n", ctime(&now) );
+	fprintf( logfile, "Using baseroot '%s'\n", baseroot );
+	fprintf( logfile, "Using wwwroot '%s'\n", pubroot );
 
-	if (errfile_name != NULL) {
-		errfile = fopen( errfile_name, "ab+" );
-		if (errfile == NULL) {
-			errx(1, "failed to open log file (\"%s\" %s)", errfile_name, strerror(errno));
-		}
+	errfile = fopen( errfile_name, "ab+" );
+
+	if (errfile == NULL) {
+		errx(1, "No such file (%s) -- %s", errfile_name, strerror(errno));
 	}
 
 	fprintf( errfile, "\n%s, %s.\n", pkgname, copyright );
-	fprintf( errfile, "Using WWWROOT '%s'\n", baseroot );
+	fprintf( logfile, "Using baseroot '%s'\n", baseroot );
+	fprintf( logfile, "Using wwwroot '%s'\n", pubroot );
+
+    if ( want_drop ) {
+        fprintf( logfile, "Setting GID to %d\n", (int)drop_gid);
+        fprintf( logfile, "Setting UID to %d\n", (int)drop_uid);
+
+        fprintf( errfile, "Setting GID to %d\n", (int)drop_gid);
+        fprintf( errfile, "Setting UID to %d\n", (int)drop_uid);
+    }
+
+	fprintf( logfile, "Started on %s\n", ctime(&now) );
 	fprintf( errfile, "Started on %s\n", ctime(&now) );
+
+	free(logfile_name);
+	free(errfile_name);
 }
 
 //-----------------------------------------------------------------------------
@@ -5293,20 +5317,21 @@ static void switch_root()
 	/* read /etc/localtime before we chroot */
 	tzset();
 
-	if (chroot(baseroot) == -1) {
-		err(1, "chroot(%s)", baseroot);
+	if (chroot(baseroot) < 0) {
+		err(1, "Failed to chroot into %s", baseroot);
 	}
 
-	fprintf( logfile, "chrooted to `%s'\n", baseroot);
+	fprintf( logfile, "Chrooted to %s\n", baseroot);
 
 	baseroot[0] = '\0';
 	baserootlen = 0;
 
-	pubroot = xstrdup("/public_html");
+	pubroot = rindex( pubroot, '/' );
 	pubrootlen = check_folder( pubroot );
+
+	stop_logging();
 }
 
-/* print usage stats */
 //-----------------------------------------------------------------------------
 static void print_usage_stats()
 //-----------------------------------------------------------------------------
@@ -5347,6 +5372,10 @@ static void release_global_mallocs()
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
 {
+#ifdef ENABLE_SLOCATE
+	free(locate_dbpath);
+#endif
+
 #ifdef ENABLE_PASSWORD
 	free_tuples( passwords );
 #endif
@@ -5354,7 +5383,6 @@ static void release_global_mallocs()
 	free_tuples( mimetypes );
 	free_tuples( inifile );
 
-	//free(passbuf);
 	free(mimebuf);
 	free(inibuf);
 
@@ -5363,7 +5391,8 @@ static void release_global_mallocs()
 	free(wwwrealm);
 	free(pubroot);
 	free(baseroot);
-	//free(index_name);
+
+	free(index_name);
 	free(server_hdr);
 }
 
@@ -5383,15 +5412,15 @@ int main(int argc, char** argv)
 		}
 	}
 
-	parse_commandline( argc, argv );
-
 	if (geteuid()) { errx(1, "Must instantiate as root !"); }
+
+	parse_commandline( argc, argv );
 
 	if (want_logging) { init_logging(); }
 
 	parse_default_extension_map();
 
-	xasprintf(&keep_alive_field, "Keep-Alive: timeout=%d\r\n", idletime);
+	xasprintf(&keep_alive_field, "Keep-Alive: timeout=60\r\n");
 
 	if (want_server_id) {
 		xasprintf(&server_hdr, "Server: %s\r\n", pkgname);
@@ -5443,8 +5472,14 @@ int main(int argc, char** argv)
 
 	init_pidfile();
 
-	if (want_chroot && want_logging) {
-		init_logging();
+#ifdef ENABLE_SLOCATE
+	init_locate();
+#endif
+
+	if (want_chroot || want_drop) {
+        if ( want_logging) {
+    		init_logging();
+        }
 	}
 
 #ifdef ENABLE_GUESTBOOK
