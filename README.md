@@ -34,7 +34,8 @@ FEATURES
    - Support for SSL connections using AWS s2n or LibreSSL tls ibrary.
    - Support for proxy connections to a backend server.
    - Support for SSL SNI connections (future release).
-   - Support for url mapping (future release).
+   - Support for url mappings (future release).
+   - Support for extended mimetypes, url mappings, and protected folders (future release).
 
 
 BUILDING
